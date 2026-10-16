@@ -1,0 +1,22 @@
+# Public synthetic protocol only. Replace dataset_version, matching fields and
+# revisions with the authorized project evaluation record before production use.
+protocol_version: case-event-v1
+dataset_version: public-synthetic-v1
+matching_policy:
+  version: demo-event-match-v1
+  key_fields: [event_type, subject_id]
+  case_sensitive: true
+candidate_limit: 100
+llm_call_budget: 200
+tool_call_budget: 200
+token_budget: 2000000
+variants:
+  - name: baseline
+    strategy_version: baseline-v1
+    disabled_components: []
+  - name: full
+    strategy_version: full-v1
+    disabled_components: []
+  - name: ablation_no_directed_supplement
+    strategy_version: full-v1-no-directed-supplement
+    disabled_components: [directed_supplement]

@@ -1,0 +1,1 @@
+"""Approval store adapters."""

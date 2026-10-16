@@ -1,0 +1,40 @@
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+DeepSeek秘钥.txt
+
+# Python/cache
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+*.egg-info/
+
+# Generated outputs and run state
+output/
+artifacts/
+run_state/
+*.trace.jsonl
+*.sqlite3
+*.sqlite
+*.db
+runtime/
+logs/
+
+# Private or local-only snapshots
+表格数据抽样_ josnl 版/
+docs/**/data/
+*_private/
+
+# Local IDE/OS files
+.idea/
+.vscode/
+*.swp
+Thumbs.db
+Desktop.ini

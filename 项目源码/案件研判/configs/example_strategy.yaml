@@ -1,0 +1,145 @@
+# Synthetic/public example scope. Replace with an authorized snapshot scope locally.
+case_id: 1
+sample_limit: 200
+top_entity_limit: 5
+top_relation_limit: 5
+evidence_per_item: 3
+
+observation_model_ids: [100, 119]
+
+entity_dictionary_model_id: 98
+
+thresholds:
+  near_amount_floor: 45000
+  near_amount_ceiling: 50000
+  night_ratio: 0.3
+  min_night_count: 10
+  high_frequency_hour: 5
+  many_counterparties: 20
+  self_transfer_ratio: 0.5
+
+models:
+  - model_id: 98
+    root_category: 人员画像
+    demo_level: source
+    demo_role: 人员、银行卡、手机号实体来源
+    model_kind: entity_dictionary
+    allowed_tools: []
+    allowed_followup_models: [5, 43, 70, 86, 101]
+    shared_entity_types: [Person, Account, Phone]
+    person_fields: [姓名]
+    account_fields: [银行卡]
+    phone_fields: [电话]
+
+  - model_id: 5
+    root_category: 人员画像
+    demo_level: L0
+    demo_role: 账户余额事实
+    model_kind: entity
+    allowed_tools: [entity_model_slice, counterparty_overlap_probe]
+    allowed_followup_models: [43, 70, 86, 101]
+    shared_entity_types: [Person, Account]
+    person_fields: [姓名]
+    account_fields: [卡号/账号]
+    amount_fields: [个人银行账户总余额(元), 最后一次交易后的账户余额(元)]
+    primary_amount_field: 个人银行账户总余额(元)
+    time_fields: [交易时间]
+    anomaly_rules: [many_counterparties]
+
+  - model_id: 28
+    root_category: 金融画像
+    demo_level: L0
+    demo_role: 消费类型分布统计
+    model_kind: category
+    allowed_tools: []
+    allowed_followup_models: [43, 101]
+    shared_entity_types: []
+    category_field: 消费类型
+    amount_fields: [交易总金额]
+    count_fields: [交易笔数]
+    primary_amount_field: 交易总金额
+
+  - model_id: 43
+    root_category: 金融画像
+    demo_level: L1
+    demo_role: 金额/时间/账户异常聚焦
+    model_kind: entity
+    allowed_tools: [entity_model_slice, counterparty_overlap_probe]
+    allowed_followup_models: [5, 70, 86, 101]
+    shared_entity_types: [Person, Account, Counterparty]
+    person_fields: [姓名]
+    account_fields: [卡号, 对手账户]
+    counterparty_fields: [交易对手]
+    direction_field: 方向
+    amount_fields: [金额]
+    primary_amount_field: 金额
+    time_fields: [交易时间]
+    anomaly_rules: [near_threshold_amount, night_activity, high_frequency_window, many_counterparties]
+
+  - model_id: 101
+    root_category: 金融画像
+    demo_level: L2
+    demo_role: 资金流向关系摘要
+    model_kind: relation
+    allowed_tools: [entity_model_slice, relation_neighbor_subgraph, fund_flow_path_probe, counterparty_overlap_probe]
+    allowed_followup_models: [43, 70, 86]
+    shared_entity_types: [Person, Account, RelationEdge]
+    person_fields: [流出对象（起点）, 流入对象（终点）]
+    account_fields: [流出账户, 流入账户]
+    counterparty_fields: [流入对象（终点）]
+    amount_fields: [交易金额]
+    primary_amount_field: 交易金额
+    time_fields: [交易时间]
+    relation:
+      source: 流出对象（起点）
+      target: 流入对象（终点）
+      value: 交易金额
+    anomaly_rules: [self_transfer_high_density, many_counterparties, structured_in_scattered_out]
+
+  - model_id: 14
+    root_category: 电信画像
+    demo_level: no-data
+    demo_role: 无话单数据分支
+    model_kind: no_data
+    allowed_tools: []
+    allowed_followup_models: []
+    shared_entity_types: []
+    no_data_reason: 当前案例没有话单来源缓存记录，因此电信画像模型没有命中结果。
+
+  - model_id: 86
+    root_category: 多维分析
+    demo_level: L2
+    demo_role: 大规模转账关系边聚合
+    model_kind: relation
+    allowed_tools: [entity_model_slice, relation_neighbor_subgraph, fund_flow_path_probe, counterparty_overlap_probe, transfer_structure_analyzer]
+    allowed_followup_models: [43, 70, 101]
+    shared_entity_types: [Person, Account, RelationEdge]
+    person_fields: [流出对象（起点）, 流入对象（终点）]
+    account_fields: [流出账户, 流入账户]
+    counterparty_fields: [流入对象（终点）]
+    amount_fields: [交易金额]
+    primary_amount_field: 交易金额
+    time_fields: [交易时间]
+    relation:
+      source: 流出对象（起点）
+      target: 流入对象（终点）
+      value: 交易金额
+    anomaly_rules: [self_transfer_high_density, many_counterparties, high_frequency_window]
+
+  - model_id: 70
+    root_category: 多维分析
+    demo_level: L1
+    demo_role: 时间窗口/同额异常
+    model_kind: entity
+    allowed_tools: [entity_model_slice, same_amount_window_probe, counterparty_overlap_probe]
+    allowed_followup_models: [43, 86, 101]
+    shared_entity_types: [Person, Account, Counterparty]
+    person_fields: [本方户名]
+    account_fields: [本方银行卡号]
+    counterparty_fields: [对端户名清单]
+    amount_fields: [转出金额]
+    count_fields: [同日相同金额转不同对端数量]
+    primary_amount_field: 转出金额
+    time_fields: [交易日期]
+    category_field: 对端户名清单
+    anomaly_rules: [same_day_same_amount, many_counterparties]

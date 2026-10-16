@@ -1,0 +1,14 @@
+# Optional LLM-as-judge evaluation dependencies.
+#
+# Install only when running faithfulness / answer relevancy judge metrics:
+#   pip install -r requirements-eval-judge.txt
+#
+# These packages can constrain LangChain-related dependencies differently from
+# the production runtime stack, so they are intentionally separated from
+# requirements.txt.
+#
+# Note: validate this file in an isolated environment before enabling judge
+# metrics in a resume/report run. Some Ragas releases import legacy
+# LangChain-Community modules that are not present in the latest runtime stack.
+ragas
+deepeval

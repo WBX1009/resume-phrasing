@@ -1,0 +1,1 @@
+{"id":"agent_tool_kb_001","question":"列出当前知识库集合，并说明是否可以继续检索。","expected_route":"agent","expected_tools":["list_knowledge_base_collections"],"notes":"Offline agent tool expectation smoke case."}

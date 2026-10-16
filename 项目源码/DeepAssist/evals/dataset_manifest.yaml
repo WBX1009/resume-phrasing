@@ -1,0 +1,64 @@
+# DeepAssist public benchmark dataset manifest
+# This file records the intended public benchmark sources. Running
+# `python evals/download_datasets.py ...` rewrites this file with local paths,
+# sample sizes, and download timestamps.
+generated_at: not_downloaded
+datasets:
+  - name: beir_nfcorpus
+    suite: retrieval
+    hf_id: BeIR/nfcorpus
+    split: test
+    sample_size: 300
+    source_url: https://huggingface.co/datasets/BeIR/nfcorpus
+    license: see_dataset_card
+  - name: beir_fiqa
+    suite: retrieval
+    hf_id: BeIR/fiqa
+    split: test
+    sample_size: 300
+    source_url: https://huggingface.co/datasets/BeIR/fiqa
+    license: see_dataset_card
+  - name: squad
+    suite: rag
+    hf_id: rajpurkar/squad
+    split: validation
+    sample_size: 300
+    source_url: https://huggingface.co/datasets/rajpurkar/squad
+    license: see_dataset_card
+  - name: hotpotqa
+    suite: rag
+    hf_id: hotpotqa/hotpot_qa
+    config: distractor
+    split: validation
+    sample_size: 300
+    source_url: https://huggingface.co/datasets/hotpotqa/hotpot_qa
+    license: see_dataset_card
+  - name: gsm8k
+    suite: agent
+    hf_id: openai/gsm8k
+    config: main
+    split: test
+    sample_size: 300
+    source_url: https://huggingface.co/datasets/openai/gsm8k
+    license: see_dataset_card
+  - name: bfcl
+    suite: agent
+    hf_id: gorilla-llm/Berkeley-Function-Calling-Leaderboard
+    split: train
+    sample_size: 300
+    source_url: https://huggingface.co/datasets/gorilla-llm/Berkeley-Function-Calling-Leaderboard
+    license: see_dataset_card
+  - name: cmrc2018
+    suite: rag
+    hf_id: hfl/cmrc2018
+    split: validation
+    sample_size: 300
+    source_url: https://huggingface.co/datasets/hfl/cmrc2018
+    license: see_dataset_card
+  - name: duretrieval
+    suite: retrieval
+    hf_id: mteb/DuRetrieval
+    split: test
+    sample_size: 300
+    source_url: https://huggingface.co/datasets/mteb/DuRetrieval
+    license: see_dataset_card

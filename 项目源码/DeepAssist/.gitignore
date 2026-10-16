@@ -1,0 +1,88 @@
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# Virtual environments
+.venv/
+.conda/
+env/
+llm-dev/
+
+# Local secrets
+.env
+.env.*
+!.env.example
+.streamlit/secrets.toml
+
+# Local data and databases
+data/
+*.db
+*.sqlite
+*.sqlite3
+
+# Evaluation artifacts
+evals/results/*
+!evals/results/.gitkeep
+
+# Vector stores and keyword indexes
+chroma/
+chroma_db/
+whoosh_index/
+my_vector_db/
+
+# Model artifacts
+*.bin
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.gguf
+*.onnx
+bge-m3/
+
+# Logs and temporary files
+logs/
+*.log
+*.tmp
+*.bak
+tmp/
+temp/
+tmp_resume_render/
+.deepeval/
+
+# IDE files
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Local scratch files
+code_dump.txt
+tree_output.txt
+test.py
+*.ipynb
+workspace/
+artifacts/
+output/
+
+# Legacy demo and ad-hoc scripts should not return to the core project.
+demo/
+scripts/*
+!scripts/
+!scripts/build_konwledge_index.py
+!scripts/test_*.py
+!scripts/test_support.py
+
+# Keep key project files explicit.
+!requirements.txt
+!requirements-eval-judge.txt
+!.env.example

@@ -1,0 +1,65 @@
+# Local configuration and credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Environments, dependencies and test caches
+.venv/
+venv/
+env/
+.conda/
+node_modules/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+.coverage
+coverage.xml
+htmlcov/
+
+# Runtime state and generated outputs
+runtime/
+workspace/
+output/
+artifacts/
+run_state/
+logs/
+tmp/
+temp/
+*.db
+*.db-*
+*.sqlite
+*.sqlite-*
+*.sqlite3
+*.sqlite3-*
+*.log
+*.tmp
+*.bak
+*.trace.jsonl
+项目源码/DeepAssist/data/
+项目源码/DeepAssist/evals/results/
+
+# Downloaded model weights and local indexes
+chroma/
+chroma_db/
+whoosh_index/
+my_vector_db/
+bge-m3/
+*.bin
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.gguf
+*.onnx
+
+# Editor and OS files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+Desktop.ini

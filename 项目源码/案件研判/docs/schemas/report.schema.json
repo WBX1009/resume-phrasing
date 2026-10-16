@@ -1,0 +1,70 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://model-insight-agent.local/schema/report-1.0.json",
+  "title": "Model Insight Agent Report",
+  "type": "object",
+  "required": ["schema_version", "manifest", "coverage", "models", "facts", "claims", "validation"],
+  "properties": {
+    "schema_version": {"const": "1.0"},
+    "manifest": {
+      "type": "object",
+      "required": ["run_id", "snapshot_sha256", "profile_count", "sampled_profile_count", "unsupported_profile_count", "online", "status"],
+      "properties": {
+        "run_id": {"type": "string", "minLength": 1},
+        "snapshot_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "profile_count": {"type": "integer", "minimum": 0},
+        "sampled_profile_count": {"type": "integer", "minimum": 0},
+        "unsupported_profile_count": {"type": "integer", "minimum": 0},
+        "online": {"type": "boolean"},
+        "status": {"enum": ["running", "success", "failed"]}
+      }
+    },
+    "coverage": {
+      "type": "object",
+      "required": ["total_models", "sampled_models", "unsupported_no_sample", "valid"]
+    },
+    "models": {"type": "array", "items": {"$ref": "#/$defs/model"}},
+    "facts": {"type": "array", "items": {"$ref": "#/$defs/fact"}},
+    "claims": {"type": "array", "items": {"$ref": "#/$defs/claim"}},
+    "validation": {"type": "object", "required": ["claims", "registry"]}
+  },
+  "$defs": {
+    "model": {
+      "type": "object",
+      "required": ["model_id", "name", "strategy_key", "coverage", "reasoning_mode", "status"],
+      "properties": {
+        "model_id": {"type": "integer"},
+        "name": {"type": "string"},
+        "strategy_key": {"type": "string", "minLength": 1},
+        "coverage": {"enum": ["sampled", "unsupported_no_sample"]},
+        "reasoning_mode": {"enum": ["deterministic", "react", "plan_solve", "plan_react_reflect"]},
+        "status": {"type": "string"}
+      }
+    },
+    "fact": {
+      "type": "object",
+      "required": ["fact_id", "model_id", "case_id", "kind", "subject", "value", "complete"],
+      "properties": {
+        "fact_id": {"type": "string", "minLength": 1},
+        "model_id": {"type": "integer"},
+        "case_id": {},
+        "kind": {"type": "string"},
+        "subject": {"type": "string"},
+        "value": {},
+        "complete": {"type": "boolean"}
+      }
+    },
+    "claim": {
+      "type": "object",
+      "required": ["claim_id", "level", "text", "model_ids", "fact_ids", "status"],
+      "properties": {
+        "claim_id": {"type": "string", "minLength": 1},
+        "level": {"enum": ["fact", "rule_hit", "inference", "unresolved"]},
+        "text": {"type": "string"},
+        "model_ids": {"type": "array", "items": {"type": "integer"}},
+        "fact_ids": {"type": "array", "items": {"type": "string"}},
+        "status": {"enum": ["accepted", "downgraded", "rejected"]}
+      }
+    }
+  }
+}

@@ -1,0 +1,42 @@
+# Core framework
+fastapi
+uvicorn
+python-multipart
+requests
+pydantic>=2.0
+pydantic-settings
+
+# AI orchestration
+langchain-core
+langgraph
+langgraph-checkpoint-sqlite
+langsmith
+openai>=1.0.0
+
+# Retrieval and embeddings
+sentence-transformers
+chromadb
+whoosh
+jieba
+tiktoken
+
+# Evaluation
+datasets
+evaluate
+pandas
+pyarrow
+numpy
+scikit-learn
+tqdm
+
+# Optional LLM-as-judge metrics live in requirements-eval-judge.txt.
+# Keep them separate because Ragas/DeepEval often pin LangChain-related
+# dependencies differently from the runtime stack.
+
+# Optional production adapters
+pymysql
+elasticsearch>=8.0.0
+mcp
+
+# Presentation
+streamlit
