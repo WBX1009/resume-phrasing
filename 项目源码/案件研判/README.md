@@ -31,7 +31,7 @@
 - `docs/execution/`：接口契约、验收边界和生命周期约束。
 - `docs/quality_pipeline.md`：离线质量流水线说明。
 - `docs/schemas/`：报告结构契约。
-- `src/case_api.py`：异步提交、状态、取消、报告读取和 SSE 事件接口；默认处理脱敏/合成输入，并可从结构化事实与模型线索生成候选事件。
+- `src/case_api.py`：异步提交、状态、取消、报告读取和 SSE 事件接口；默认处理脱敏/合成输入，并可从结构化事实与模型线索生成候选风险疑点。
 - `configs/example_strategy.yaml`：脱敏后的策略示例，不包含真实记录。
 - `configs/example_evaluation_protocol.yaml`：用于说明 baseline、完整策略和单项 ablation 如何冻结评测控制条件。
 - `AI_CONTEXT.md`：供 ChatGPT 或其他编程助手快速理解项目的上下文入口。
@@ -54,10 +54,10 @@
 `GET /v1/case-runs/{run_id}/events` SSE。任务台账写入 SQLite，LangGraph
 检查点默认写入独立 SQLite 文件；真实 Planner、Worker、Verifier、GaussDB
 连接和报告投影通过 `CaseRunService` 注入。公开版的默认服务不包含生产数据库、
-专家标注或线上指标。任务可以显式提供结构化候选，也可以把脱敏 fact pack 和
+专家标注或线上指标。任务可以显式提供候选风险疑点，也可以把脱敏 fact pack 和
 结构化 model clues 交给 `src.candidate_events.py` 生成带来源、事实引用和风险
-标签的候选；不会从证据文本自动推断事件。集中核验前统一执行候选校验与
-`candidate_limit` 限额。服务入口对每个 Task 复用 `src.case_worker_subgraph.py`
+标签的候选风险疑点；不会把疑点当成已经证实的风险事件。集中核验前统一执行疑点校验与
+`candidate_limit` 疑点数量限额。服务入口对每个 Task 复用 `src.case_worker_subgraph.py`
 的隔离补证子图；验证缺口可由 `src.directed_supplement.py` 转成范围受限的
 recheck Task；外部写操作可通过
 `TaskExecutionContext.idempotent_tool_call()` 走 SQLite 幂等账本。
@@ -88,3 +88,4 @@ python -m venv .venv
 ## 给 ChatGPT 的使用方式
 
 先让模型阅读 `AI_CONTEXT.md`，再指定要分析的模块或设计问题。涉及代码修改时，要求它先说明事实边界、输入输出契约、测试影响和是否需要真实数据；不要让它猜测私有数据库内容或凭空补齐业务指标。
+

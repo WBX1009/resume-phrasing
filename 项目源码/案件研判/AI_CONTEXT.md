@@ -20,7 +20,7 @@
 - `src/quality_reasoning.py`：策略路由、工具调用和 Claim 构建。
 - `src/agent_loop.py`：模型类级 Planner → Tool → Judge 循环。
 - `src/supplement_tools.py`：补证工具及参数约束。
-- `src/candidate_events.py`：把确定性异常标记和结构化模型线索整理为可追溯候选事件。
+- `src/candidate_events.py`：把确定性异常标记和结构化模型线索整理为可追溯的候选风险疑点。
 - `src/directed_supplement.py`：把核验缺口转换为范围受限的补证任务。
 - `src/evaluation_protocol.py`：冻结 baseline、完整策略和 ablation 的评测控制条件。
 - `src/evidence_chain.py`：证据步骤、引用和状态转移。
@@ -57,6 +57,7 @@ Snapshot
 
 公开版没有携带原项目的真实快照，因此依赖私有快照的全量质量测试不能直接运行。应使用新的合成或经授权脱敏 fixture 重新建立测试基线，而不是复制原始业务数据。
 
-公开版候选生成只接受确定性 FactPack 和结构化 model clues；它不会从自由文本推断真实风险事件。事件匹配策略、真实风险规则、基线流程、补证案例、专家标注和简历中的生产指标仍需由授权材料确认。
+公开版候选风险疑点生成只接受确定性 FactPack 和结构化 model clues；它不会从自由文本推断真实风险事件。事件匹配策略、真实风险规则、基线流程、补证案例、专家标注和简历中的生产指标仍需由授权材料确认。
 默认公开服务还接受任务 payload 中的结构化 `verification.gaps` 作为合成核验边界，
 用来演示缺口转补证任务和再次核验；这不代表公开版包含生产 Verifier 或真实补证结果。
+

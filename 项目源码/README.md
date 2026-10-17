@@ -15,7 +15,7 @@
 
 | 项目与主题 | 主要路径 |
 | --- | --- |
-| 案件研判：参数化查询、事实与候选 | `案件研判/src/row_source.py`、`anomaly_rules.py`、`candidate_events.py` |
+| 案件研判：参数化查询、事实与疑点 | `案件研判/src/row_source.py`、`anomaly_rules.py`、`candidate_events.py` |
 | 案件研判：核验与定向补证 | `案件研判/src/case_workflow_graph.py`、`directed_supplement.py`；默认公开服务在 `case_api.py` |
 | 案件研判：任务调度、状态与恢复 | `案件研判/src/case_task_scheduler.py`、`case_worker_subgraph.py`、`case_run_service.py` |
 | 案件研判：事件与性能评测 | `案件研判/src/event_evaluation.py`、`evaluation_protocol.py`、`langsmith_event_evaluation.py`、`performance_evaluation.py` |
@@ -44,3 +44,4 @@ python -B -m pytest -q -p no:cacheprovider
 ```
 
 运行时仍可能新建数据库或工作目录；根目录与各项目的 `.gitignore` 用于排除这些生成物。
+
