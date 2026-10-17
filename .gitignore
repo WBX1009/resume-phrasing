@@ -43,6 +43,9 @@ temp/
 项目源码/DeepAssist/data/
 项目源码/DeepAssist/evals/results/
 
+# Resume layout sources are kept locally; track only the exported PDF.
+/简历正文与排版/
+
 # Downloaded model weights and local indexes
 chroma/
 chroma_db/
