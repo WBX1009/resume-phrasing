@@ -66,3 +66,7 @@ bge-m3/
 .DS_Store
 Thumbs.db
 Desktop.ini
+
+# Local interview assistant configuration and prompt notes
+/面试开放性问答/模拟练习智能体配置/
+/面试开放性问答/润色分析与提示词_AI 自动润色版.md
