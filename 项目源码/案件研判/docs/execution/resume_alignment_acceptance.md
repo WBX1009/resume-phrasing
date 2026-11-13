@@ -23,7 +23,7 @@
 
 本轮以核心实现链路、主入口调用和自动化回归均通过为代码级对齐完成；部署扩展材料和真实业务证据单独记录。合成测试通过不等于生产指标已经由公开源码复算。
 
-实现策略优先复用 LangGraph 的状态、任务分发、并发配置和检查点能力；验收检查业务行为与恢复结果。当前实现保留 SQLite TaskRun 账本，用于预算、幂等键、任务结果与 API 状态读取；`CaseRunService` 将其与 LangGraph SQLite Checkpointer 组合。
+实现策略优先复用 LangGraph 的状态、任务分发、并发配置和检查点能力；验收检查业务行为与恢复结果。当前实现通过 LangGraph 任务子图的 Send、RetryPolicy、timeout、error_handler 和 Checkpointer 执行及恢复任务。SQLite 保留原子预算、外部幂等、案件元数据及可重建任务查询投影；投影不驱动调度。详见 [原生任务运行说明](native_task_runtime.md)。
 
 ## 当前实现与状态
 
@@ -31,12 +31,12 @@
 | --- | --- | --- |
 | 事件级匹配、TP/FP/FN、一对一最大匹配、事件计数汇总及案件组切分校验 | `src/event_evaluation.py`；`tests/test_event_evaluation.py` | 组件通过；没有专家标注集，业务匹配规则仍须由标注协议冻结 |
 | LangSmith 行级 Evaluator、跨案件/重复运行汇总、冻结控制元数据校验 | `src/langsmith_event_evaluation.py`；本地 LangSmith SDK `upload_results=False` 契约测试 | 组件通过；未创建或运行托管 Dataset/正式版本 Experiment |
-| 任务依赖、案件实体/事实/时间/工具范围、每案活动上限、同一事件循环内的 LLM 与数据库请求限流、SQLite 预算及任务状态 | `src/case_task_scheduler.py`；`tests/test_case_task_scheduler.py` | 组件通过；服务入口的跨案件共享请求限流仍待完善，真实数据库/补证工具的部署级限流仍需目标环境验收 |
+| 任务依赖、案件实体/事实/时间/工具范围、每案活动上限、同一事件循环内的 LLM 与数据库请求限流、SQLite 预算及任务状态 | `src/case_execution.py`；`src/case_task_graph.py`；`tests/test_case_task_graph.py`；`tests/test_case_native_runtime.py` | 合成组件及服务跨案件共享请求限流通过；真实数据库/补证工具的部署级限流仍需目标环境验收 |
 | LangGraph 规划—调度—集中核验—有限定向补证—汇总流程 | `src/case_workflow_graph.py`；`src/case_worker_subgraph.py`；`src/case_run_service.py`；`langgraph-checkpoint-sqlite` | 合成图与可复用补证子图通过；服务入口使用持久化 SQLite Checkpointer；真实 Planner/Worker/Verifier/报告节点仍需授权环境验收 |
 | nearest-rank p50/p95、逐案中位数、配对降幅、失败保留与对照控制校验 | `src/performance_evaluation.py`；`tests/test_performance_evaluation.py` | 统计组件通过；用户确认 p95 35→27 分钟，工作区未提供完整研判原始计时日志 |
-| 案件级候选风险疑点产生与固定疑点数上限 | `src/candidate_events.py` 将规则异常标记与结构化模型线索转换为带来源和事实引用的候选风险疑点；`src/case_workflow_graph.py` 统一校验并执行 `TaskSchedulerConfig.candidate_limit`；显式疑点输入仍兼容 | 公开合成链路通过；真实事件语义、专家 Gold 和指标仍需授权数据验收 |
+| 案件级候选风险疑点产生与固定疑点数上限 | `src/candidate_events.py` 将规则异常标记与结构化模型线索转换为带来源和事实引用的候选风险疑点；`src/case_workflow_graph.py` 统一校验并执行 `CaseExecutionConfig.candidate_limit`；显式疑点输入仍兼容 | 公开合成链路通过；真实事件语义、专家 Gold 和指标仍需授权数据验收 |
 | GaussDB 百万级数据完整链路、真实专家事件标注、86.5%→92.4% 等指标复算 | `src/row_source.py` 的参数化、服务端分页 GaussDB 适配器；`src/event_evaluation.py` 与 `src/langsmith_event_evaluation.py` 的事件级评测链路 | 用户确认的指标作为本轮事实依据；代码级事件评分、预算校验与对比约束通过 |
-| FastAPI 异步提交/状态/取消/报告端点与 SSE | `src/case_api.py`；`src/case_run_service.py`；`tests/test_case_api.py`；`tests/test_case_process_recovery.py` | 合成输入、SQLite TaskRun 账本、LangGraph SQLite checkpoint、报告先持久化后成功和 SSE 事件链路通过 |
+| FastAPI 异步提交/状态/取消/报告端点与 SSE | `src/case_api.py`；`src/case_run_service.py`；`tests/test_case_api.py`；`tests/test_case_process_recovery.py` | 合成输入、SQLite 查询投影、LangGraph SQLite checkpoint、报告与终态原子发布及 SSE 事件链路通过 |
 | LangSmith 托管 Dataset/Experiment、真实 Trace 关联及脱敏审查 | `src/langsmith_event_evaluation.py` 的 Dataset/Experiment 与 metadata 适配器；本地 SDK 契约测试 | 代码适配与本地契约通过；托管服务由部署配置启用，不作为本轮源码对齐阻塞 |
 | 真实端到端串行/受限并发耗时和 p95 | `src/performance_evaluation.py` 的 nearest-rank 统计、逐案中位数、配对降幅和失败保留 | 用户确认的 35→27 分钟作为本轮事实依据；统计口径、配对校验、失败保留和 nearest-rank p95 代码通过 |
 
@@ -60,11 +60,11 @@
 
 1. LLM 只提出 Task 和依赖；并发上限来自调用方/前端配置，后端以 `case_task_limit ≤ server_task_cap` 校验并在一次运行内冻结。人数或行数不直接决定并发数，LLM 不能增加并发、疑点数量或全案预算。
 2. 每个 Task 必须有案件内实体和至少一个已知 Fact 引用；可选时间窗须是有效 ISO-8601 并位于案件授权范围；工具必须同时通过案件级与任务级白名单。缺字段、越权、未知依赖、环依赖、重复 Task ID、超任务数都必须在执行前失败关闭。
-3. 只有全部前置 Task 成功且产物存在时，后续 Task 才能启动。优先由框架分发就绪任务并限制并发，单案活跃 Task 数不得超过冻结上限；接受原生 superstep 的汇合语义，不强制另写“单任务完成即启动依赖”的调度器。跨案件共享的 LLM/数据库限流器必须在真实服务进程/部署模型中验证；基于 `asyncio.Semaphore` 的限流应在同一事件循环中使用，不能直接跨线程共享。当前线程池服务的跨案件共享请求限流仍待完善。
+3. 只有全部前置 Task 成功且产物存在时，后续 Task 才能启动。优先由框架分发就绪任务并限制并发，单案活跃 Task 数不得超过冻结上限；接受原生 superstep 的汇合语义，不强制另写“单任务完成即启动依赖”的调度器。跨案件共享的 LLM/数据库限流器必须在真实服务进程/部署模型中验证；基于 `asyncio.Semaphore` 的限流应在同一事件循环中使用，不能直接跨线程共享。服务已改为同一事件循环承载案件，共享额度有服务级合成测试；同一个 SQLite 运行库只允许一个服务实例持有恢复所有权。
 4. Worker 的局部消息、证据、调用历史和执行状态不能混入其他任务；共享 FactPack 只读，结果按 Task ID 汇合。须验证子图调用方式、共享字段及检查点命名空间的边界；允许直接使用框架机制完成隔离。
 5. 预算通过原子账本执行；重试、取消、异常及恢复不得绕过调用/Token 上限。`TaskExecutionContext.idempotent_tool_call()` 以稳定任务键加操作名建立外部操作账本，成功结果重放缓存，本地预算拒绝记为失败，未决操作恢复时 fail-closed；真实下游服务是否接受并按该操作键去重仍需目标环境验收。
 6. 必须做进程级故障注入：在计划写入、Task 启动、外部调用返回、Task 结果提交、集中核验和报告持久化边界分别中断；重启后从持久状态恢复，不能丢结果、双计费、重复副作用或拿旧轮输出冒充新运行。
-7. 持久化 LangGraph Checkpointer 必须证明跨进程恢复；若另有 TaskRun 账本，须验证其与检查点的一致性。`CaseRunService` 已接入 SQLite Checkpointer，`tests/test_case_process_recovery.py` 已用两个独立 Python 进程验证 checkpoint 写入后读回；FastAPI 的提交、查询、取消、报告读取和 SSE 已有本地合成输入集成测试，但计划写入/Task 结果提交/集中核验/报告持久化边界的故障注入，以及真实部署一致性仍需目标环境验收。
+7. 持久化 LangGraph Checkpointer 必须证明跨进程恢复。`tests/test_case_process_recovery.py` 在任务部分完成、集中核验、补证和报告发布边界以 `os._exit` 退出进程，启动新服务恢复，验证已保存任务不重跑、计划不重做及报告可读。查询投影损坏后的重建由单独测试覆盖。真实部署、外部系统副作用核对及生产性能仍需目标环境验收。
 
 ## 必须通过的性能测量门槛
 
@@ -93,7 +93,7 @@
 
 ```powershell
 python -m pip install -e ".[workflow,evaluation,dev]"
-python -m pytest -q tests/test_case_task_scheduler.py tests/test_case_worker_subgraph.py tests/test_case_workflow_graph.py tests/test_case_api.py tests/test_case_process_recovery.py tests/test_event_evaluation.py tests/test_performance_evaluation.py tests/test_langsmith_event_evaluation.py
+python -m pytest -q tests/test_case_native_runtime.py tests/test_case_task_graph.py tests/test_case_worker_subgraph.py tests/test_case_workflow_graph.py tests/test_case_api.py tests/test_case_process_recovery.py tests/test_event_evaluation.py tests/test_performance_evaluation.py tests/test_langsmith_event_evaluation.py
 ```
 
 这些命令验收独立组件、合成接口和本地 SDK 契约；生产环境仍可按上方扩展清单补充数据库、托管追踪和耗时材料。

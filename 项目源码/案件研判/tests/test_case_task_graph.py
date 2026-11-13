@@ -2,17 +2,19 @@ import asyncio
 from pathlib import Path
 
 import pytest
+from case_graph_support import run_tasks
+from src.case_task_graph import CaseTaskExecutor
 
-from src.case_task_scheduler import (
+from src.case_execution import (
     BudgetLimitExceeded,
-    CaseTaskScheduler,
     CaseTaskScope,
     InvestigationTask,
     PlanError,
+    TaskExecutionError,
     SQLiteRunStore,
     SharedResourceLimits,
     TaskExecutionContext,
-    TaskSchedulerConfig,
+    CaseExecutionConfig,
     validate_task_plan,
 )
 
@@ -72,21 +74,25 @@ def test_plan_requires_case_scope_fact_support_and_in_range_iso_dates():
 
 def test_config_rejects_bool_as_integer_and_case_limit_above_server_cap():
     with pytest.raises(ValueError, match="positive integer"):
-        TaskSchedulerConfig(case_task_limit=True)
+        CaseExecutionConfig(case_task_limit=True)
     with pytest.raises(ValueError, match="server_task_cap"):
-        TaskSchedulerConfig(case_task_limit=3, server_task_cap=2)
+        CaseExecutionConfig(case_task_limit=3, server_task_cap=2)
 
 
-def test_scheduler_never_exceeds_limit_and_fills_slot_when_one_task_finishes(tmp_path: Path):
+def test_executor_never_exceeds_limit_and_fills_slot_when_one_task_finishes(tmp_path: Path):
     async def scenario():
         observed = {"active": 0, "maximum": 0, "started": [], "finished": []}
         lock = asyncio.Lock()
+        pair_started = asyncio.Event()
 
         async def worker(current_task, task_input, context):
             async with lock:
                 observed["active"] += 1
                 observed["maximum"] = max(observed["maximum"], observed["active"])
                 observed["started"].append(current_task.task_id)
+            if len(observed["started"]) == 2:
+                pair_started.set()
+            await asyncio.wait_for(pair_started.wait(), timeout=5)
             await asyncio.sleep(0.01)
             async with lock:
                 observed["active"] -= 1
@@ -94,21 +100,21 @@ def test_scheduler_never_exceeds_limit_and_fills_slot_when_one_task_finishes(tmp
             return {"task_id": current_task.task_id}
 
         tasks = [task(f"t-{index}") for index in range(7)]
-        scheduler = CaseTaskScheduler(
+        executor = CaseTaskExecutor(
             SQLiteRunStore(tmp_path / "runs.sqlite3"),
             worker,
-            config=TaskSchedulerConfig(case_task_limit=2, server_task_cap=4),
+            config=CaseExecutionConfig(case_task_limit=2, server_task_cap=4),
         )
-        result = await scheduler.run("run-1", tasks, {"facts": ["safe"]}, scope=scope())
-        assert result.status == "success"
-        assert result.succeeded_count == 7
-        assert observed["maximum"] == result.max_active_tasks == 2
+        result = await run_tasks(executor, "run-1", tasks, {"facts": ["safe"]}, scope=scope())
+        assert all(item["status"] == "succeeded" for item in result["outcomes"].values())
+        assert sum(item["status"] == "succeeded" for item in result["outcomes"].values()) == 7
+        assert observed["maximum"] == 2
         assert len(observed["started"]) == len(observed["finished"]) == 7
 
     asyncio.run(scenario())
 
 
-def test_scheduler_waits_for_dependencies_but_runs_independent_tasks(tmp_path: Path):
+def test_executor_waits_for_dependencies_but_runs_independent_tasks(tmp_path: Path):
     async def scenario():
         order = []
 
@@ -119,13 +125,13 @@ def test_scheduler_waits_for_dependencies_but_runs_independent_tasks(tmp_path: P
             return {"task": current_task.task_id}
 
         tasks = [task("a"), task("b"), task("c", depends_on=("a",))]
-        result = await CaseTaskScheduler(
+        result = await run_tasks(CaseTaskExecutor(
             SQLiteRunStore(tmp_path / "runs.sqlite3"),
             worker,
-            config=TaskSchedulerConfig(case_task_limit=2),
-        ).run("run-1", tasks, {"seed": 1}, scope=scope())
+            config=CaseExecutionConfig(case_task_limit=2),
+        ), "run-1", tasks, {"seed": 1}, scope=scope())
 
-        assert result.status == "success"
+        assert all(item["status"] == "succeeded" for item in result["outcomes"].values())
         assert order.index(("end", "a")) < order.index(("start", "c"))
         assert ("start", "a") in order and ("start", "b") in order
 
@@ -136,17 +142,17 @@ def test_failed_prerequisite_blocks_descendants_and_keeps_independent_work(tmp_p
     async def scenario():
         async def worker(current_task, task_input, context):
             if current_task.task_id == "bad":
-                raise RuntimeError("tool unavailable")
+                raise TaskExecutionError("tool unavailable")
             return {"ok": True}
 
-        result = await CaseTaskScheduler(
-            SQLiteRunStore(tmp_path / "runs.sqlite3"), worker, config=TaskSchedulerConfig(case_task_limit=2)
-        ).run("run-1", [task("bad"), task("dependent", depends_on=("bad",)), task("independent")], {}, scope=scope())
+        result = await run_tasks(CaseTaskExecutor(
+            SQLiteRunStore(tmp_path / "runs.sqlite3"), worker, config=CaseExecutionConfig(case_task_limit=2)
+        ), "run-1", [task("bad"), task("dependent", depends_on=("bad",)), task("independent")], {}, scope=scope())
 
-        assert result.status == "failed"
-        assert result.tasks["bad"]["status"] == "failed"
-        assert result.tasks["dependent"]["status"] == "blocked"
-        assert result.tasks["independent"]["status"] == "succeeded"
+        assert any(item["status"] != "succeeded" for item in result["outcomes"].values())
+        assert result["outcomes"]["bad"]["status"] == "failed"
+        assert result["outcomes"]["dependent"]["status"] == "blocked"
+        assert result["outcomes"]["independent"]["status"] == "succeeded"
 
     asyncio.run(scenario())
 
@@ -161,20 +167,20 @@ def test_task_inputs_are_isolated_and_llm_budget_is_shared_and_atomic(tmp_path: 
             return await context.llm_call(model_call, max_output_tokens=500)
 
         store = SQLiteRunStore(tmp_path / "runs.sqlite3")
-        scheduler = CaseTaskScheduler(
+        executor = CaseTaskExecutor(
             store,
             worker,
-            config=TaskSchedulerConfig(case_task_limit=2, max_llm_calls=1, max_reserved_tokens=500),
+            config=CaseExecutionConfig(case_task_limit=2, max_llm_calls=1, max_reserved_tokens=500),
             resources=SharedResourceLimits(llm_request_cap=1, db_query_cap=1),
         )
         facts = {"mutable": []}
-        result = await scheduler.run("run-1", [task("a"), task("b")], facts, scope=scope())
+        result = await run_tasks(executor, "run-1", [task("a"), task("b")], facts, scope=scope())
 
         assert facts == {"mutable": []}
-        assert result.failed_count == 1
-        assert result.succeeded_count == 1
-        assert result.budget == {"llm_calls": 1, "tool_calls": 0, "reserved_tokens": 500}
-        assert any("BudgetLimitExceeded" in (run["error"] or "") for run in result.tasks.values())
+        assert sum(item["status"] == "failed" for item in result["outcomes"].values()) == 1
+        assert sum(item["status"] == "succeeded" for item in result["outcomes"].values()) == 1
+        assert store.budget_usage(result["run_id"]) == {"llm_calls": 1, "tool_calls": 0, "reserved_tokens": 500}
+        assert any("BudgetLimitExceeded" in (run["error"] or "") for run in result["outcomes"].values())
 
     asyncio.run(scenario())
 
@@ -182,9 +188,9 @@ def test_task_inputs_are_isolated_and_llm_budget_is_shared_and_atomic(tmp_path: 
 def test_tool_call_rejects_non_whitelisted_tool_before_spending_budget(tmp_path: Path):
     async def scenario():
         store = SQLiteRunStore(tmp_path / "runs.sqlite3")
-        config = TaskSchedulerConfig()
+        config = CaseExecutionConfig()
         task_spec = task("a", tools=("lookup",))
-        store.start_run("run-1", [task_spec], config, scope())
+        store.prepare_task_projection("run-1", [task_spec], config, scope())
         context = TaskExecutionContext(
             run_id="run-1",
             task=task_spec,
@@ -223,81 +229,42 @@ def test_shared_database_cap_applies_across_concurrent_case_runs(tmp_path: Path)
                 tool_name="lookup",
             )
 
-        config = TaskSchedulerConfig(case_task_limit=2, server_task_cap=2)
+        config = CaseExecutionConfig(case_task_limit=2, server_task_cap=2)
         store = SQLiteRunStore(tmp_path / "runs.sqlite3")
-        scheduler = CaseTaskScheduler(store, worker, config=config, resources=resources)
+        executor = CaseTaskExecutor(store, worker, config=config, resources=resources)
         results = await asyncio.gather(
-            scheduler.run("case-a", [task("a1"), task("a2")], {"case": "a"}, scope=scope()),
-            scheduler.run("case-b", [task("b1"), task("b2")], {"case": "b"}, scope=scope()),
+            run_tasks(executor, "case-a", [task("a1"), task("a2")], {"case": "a"}, scope=scope()),
+            run_tasks(executor, "case-b", [task("b1"), task("b2")], {"case": "b"}, scope=scope()),
         )
 
-        assert all(result.status == "success" for result in results)
+        assert all(all(item["status"] == "succeeded" for item in result["outcomes"].values()) for result in results)
         assert observed["maximum"] == 1
         assert observed["calls"] == 4
-        assert sum(result.succeeded_count for result in results) == 4
+        assert sum(sum(item["status"] == "succeeded" for item in result["outcomes"].values()) for result in results) == 4
 
     asyncio.run(scenario())
 
 
-def test_run_id_rejects_different_plan_or_budget(tmp_path: Path):
-    async def scenario():
-        async def worker(current_task, task_input, context):
-            return {"ok": True}
-
-        scheduler = CaseTaskScheduler(SQLiteRunStore(tmp_path / "runs.sqlite3"), worker)
-        await scheduler.run("stable-id", [task("a")], {}, scope=scope())
-        with pytest.raises(ValueError, match="different plan, scope, or budget"):
-            await scheduler.run("stable-id", [task("b")], {}, scope=scope())
-
-    asyncio.run(scenario())
+def test_admission_rejects_replaced_plan_or_budget(tmp_path):
+    store = SQLiteRunStore(tmp_path / "runs.db")
+    state = {"run_id": "r", "tasks": [task("a").to_dict()]}
+    store.admit(state, CaseExecutionConfig(), scope())
+    with pytest.raises(ValueError, match="different plan"):
+        store.admit({**state, "tasks": [task("b").to_dict()]}, CaseExecutionConfig(), scope())
+    with pytest.raises(ValueError, match="different scope or budget"):
+        store.admit(state, CaseExecutionConfig(max_llm_calls=1), scope())
 
 
-def test_interrupted_running_task_is_retried_with_the_same_idempotency_key(tmp_path: Path):
-    async def scenario():
-        store = SQLiteRunStore(tmp_path / "runs.sqlite3")
-        plan = [task("a")]
-        config = TaskSchedulerConfig()
-        store.start_run("run-1", plan, config, scope())
-        store.save_task("run-1", "a", "running", increment_attempt=True)
-        old_key = store.load_tasks("run-1")["a"]["idempotency_key"]
-        seen = []
-
-        async def worker(current_task, task_input, context):
-            seen.append(context.idempotency_key)
-            return {"recovered": True}
-
-        result = await CaseTaskScheduler(store, worker, config=config).run("run-1", plan, {}, scope=scope())
-
-        assert result.status == "success"
-        assert seen == [old_key]
-        assert result.tasks["a"]["attempts"] == 2
-
-    asyncio.run(scenario())
-
-
-def test_targeted_recheck_tasks_append_without_resetting_run_budget_or_results(tmp_path: Path):
+def test_failure_blocks_all_descendants_even_in_reverse_dependency_order(tmp_path):
     async def scenario():
         calls = []
-
-        async def worker(current_task, task_input, context):
-            calls.append(current_task.task_id)
-            return {"task": current_task.task_id}
-
-        scheduler = CaseTaskScheduler(SQLiteRunStore(tmp_path / "runs.sqlite3"), worker)
-        original = [task("initial")]
-        first = await scheduler.run("run-1", original, {}, scope=scope())
-        with pytest.raises(ValueError, match="scope differs"):
-            scheduler.append_recheck_tasks(
-                "run-1",
-                [task("outside-scope", entities=("person-2",))],
-                scope=scope(entities=("person-1", "person-2")),
-            )
-        scheduler.append_recheck_tasks("run-1", [task("recheck", depends_on=("initial",))], scope=scope())
-        second = await scheduler.run("run-1", original, {}, scope=scope())
-
-        assert first.status == second.status == "success"
-        assert calls == ["initial", "recheck"]
-        assert second.tasks["initial"]["attempts"] == 1
-        assert second.tasks["recheck"]["status"] == "succeeded"
-
+        async def worker(t, data, context):
+            calls.append(t.task_id)
+            if t.task_id == "z":
+                raise TaskExecutionError("synthetic tool failure")
+            return {}
+        result = await run_tasks(CaseTaskExecutor(SQLiteRunStore(tmp_path / "runs.sqlite3"), worker),
+            "r", [task("a", depends_on=("b",)), task("b", depends_on=("z",)), task("z"), task("independent")], {}, scope=scope())
+        assert result["outcomes"]["a"]["status"] == result["outcomes"]["b"]["status"] == "blocked"
+        assert set(calls) == {"z", "independent"}
     asyncio.run(scenario())

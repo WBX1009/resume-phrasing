@@ -7,7 +7,7 @@ import hashlib
 import json
 from typing import Any
 
-from .case_task_scheduler import InvestigationTask
+from .case_execution import InvestigationTask
 
 
 def build_recheck_tasks(state: Mapping[str, Any], *, max_tasks: int = 20) -> list[InvestigationTask]:
@@ -16,7 +16,7 @@ def build_recheck_tasks(state: Mapping[str, Any], *, max_tasks: int = 20) -> lis
     if not isinstance(gaps, Sequence) or isinstance(gaps, (str, bytes, Mapping)):
         return []
 
-    task_runs = state.get("task_runs") or {}
+    task_outcomes = state.get("task_outcomes") or {}
     candidates = {
         str(event.get("event_id")): event
         for event in state.get("candidate_events", []) or []
@@ -32,7 +32,7 @@ def build_recheck_tasks(state: Mapping[str, Any], *, max_tasks: int = 20) -> lis
         if not isinstance(raw_gap, Mapping):
             continue
         gap = dict(raw_gap)
-        source_task = task_runs.get(str(gap.get("task_id"))) or {}
+        source_task = task_outcomes.get(str(gap.get("task_id"))) or {}
         source_spec = source_task.get("task") if isinstance(source_task, Mapping) else {}
         source_spec = source_spec if isinstance(source_spec, Mapping) else {}
         candidate = candidates.get(str(gap.get("candidate_event_id")))

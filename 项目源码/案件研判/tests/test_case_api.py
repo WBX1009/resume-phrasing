@@ -2,18 +2,93 @@ import time
 import asyncio
 from pathlib import Path
 import sqlite3
+import pytest
+import threading
 
 from fastapi.testclient import TestClient
 
 from src.case_api import _build_default_service, create_app
 from src.candidate_events import CandidateEventBuilder
 from src.case_run_service import CaseRunService
-from src.case_task_scheduler import (
+from src.case_execution import (
     CaseTaskScope,
     InvestigationTask,
     SQLiteRunStore,
-    TaskSchedulerConfig,
+    CaseExecutionConfig,
 )
+
+
+def test_service_owns_database_until_closed(tmp_path):
+    service = _service(tmp_path)
+    try:
+        with pytest.raises(ValueError, match="active service owner"):
+            _service(tmp_path)
+    finally:
+        service.close()
+    replacement = _service(tmp_path)
+    replacement.close()
+
+
+def test_service_shared_resources_limit_concurrent_cases_on_one_loop(tmp_path):
+    service = _service(tmp_path)
+    active = maximum = calls = 0
+    paired = asyncio.Event()
+    async def worker(task, data, context):
+        async def request():
+            nonlocal active, maximum, calls
+            active += 1
+            maximum = max(maximum, active)
+            if active == 2:
+                paired.set()
+            try:
+                await asyncio.wait_for(paired.wait(), timeout=10)
+                await asyncio.sleep(.03)
+                calls += 1
+                return {}
+            finally:
+                active -= 1
+        return await context.llm_call(request, max_output_tokens=10)
+    service._worker = worker
+    try:
+        for i in range(4):
+            payload = _request_payload()
+            payload["run_id"] = f"r{i}"
+            payload["initial_tasks"] = payload.pop("tasks")
+            service.submit(payload)
+        for future in list(service._futures.values()):
+            future.result(timeout=15)
+        assert calls == 4 and maximum == 2
+        assert all(service.status(f"r{i}")["status"] == "success" for i in range(4))
+    finally:
+        service.close()
+
+
+def test_service_shutdown_drains_and_next_service_resumes(tmp_path):
+    service = _service(tmp_path)
+    entered = threading.Event()
+    calls = []
+    original = service._worker
+    async def worker(task, data, context):
+        calls.append(task.task_id)
+        entered.set()
+        await asyncio.sleep(.2)
+        return await original(task, data, context)
+    service._worker = worker
+    payload = _request_payload()
+    payload["initial_tasks"] = payload.pop("tasks")
+    service.submit(payload)
+    assert entered.wait(timeout=10)
+    service.close()
+    assert service.status(payload["run_id"])["status"] in {"running", "success"}
+    replacement = _service(tmp_path)
+    try:
+        for future in replacement._futures.values():
+            future.result(timeout=10)
+        assert replacement.status(payload["run_id"])["status"] == "success"
+        assert replacement.report(payload["run_id"]) is not None
+        assert calls == ["task-1"]
+    finally:
+        replacement.close()
 
 
 def _service(tmp_path: Path) -> CaseRunService:
@@ -41,7 +116,7 @@ def _service(tmp_path: Path) -> CaseRunService:
         return {
             "case_id": state["case_id"],
             "run_id": state["run_id"],
-            "task_runs": state["task_runs"],
+            "task_outcomes": state["task_outcomes"],
             "verification": state["verification"],
             "candidate_events": state.get("candidate_events", []),
             "final_events": state.get("final_events", []),
@@ -123,7 +198,7 @@ def test_case_run_store_persists_cancel_and_failure_fields(tmp_path: Path):
         "fact_ids": ["fact-1"],
         "allowed_tools": [],
     }
-    store.prepare_run("run-state", TaskSchedulerConfig(), CaseTaskScope(
+    store.prepare_run("run-state", CaseExecutionConfig(), CaseTaskScope(
         entity_ids=frozenset(scope["entity_ids"]),
         fact_ids=frozenset(scope["fact_ids"]),
         allowed_tools=frozenset(),

@@ -6,7 +6,8 @@ import pytest
 pytest.importorskip("langgraph")
 from langgraph.checkpoint.memory import InMemorySaver
 
-from src.case_task_scheduler import CaseTaskScheduler, InvestigationTask, SQLiteRunStore, TaskSchedulerConfig
+from src.case_execution import InvestigationTask, SQLiteRunStore, CaseExecutionConfig
+from src.case_task_graph import CaseTaskExecutor
 from src.case_workflow_graph import build_case_workflow_graph
 
 
@@ -40,7 +41,7 @@ def test_langgraph_plans_dispatches_centrally_verifies_and_runs_limited_recheck(
             return [task("initial")]
 
         async def verifier(state, context):
-            verification_calls.append(state["task_runs"])
+            verification_calls.append(state["task_outcomes"])
             if len(verification_calls) == 1:
                 return {"gaps": [{"fact_id": "gap-1"}], "accepted_events": []}
             return {"gaps": [], "accepted_events": ["event-1"]}
@@ -55,10 +56,10 @@ def test_langgraph_plans_dispatches_centrally_verifies_and_runs_limited_recheck(
         async def summarizer(state, context):
             return {"ready": True, "unresolved": state["verification"]["gaps"]}
 
-        scheduler = CaseTaskScheduler(
+        executor = CaseTaskExecutor(
             SQLiteRunStore(tmp_path / "runs.sqlite3"),
             worker,
-            config=TaskSchedulerConfig(
+            config=CaseExecutionConfig(
                 case_task_limit=2,
                 server_task_cap=4,
                 max_llm_calls=3,
@@ -67,7 +68,7 @@ def test_langgraph_plans_dispatches_centrally_verifies_and_runs_limited_recheck(
         )
         graph = build_case_workflow_graph(
             planner=planner,
-            scheduler=scheduler,
+            executor=executor,
             verifier=verifier,
             recheck_planner=recheck_planner,
             recheck_allowed=recheck_allowed,
@@ -91,9 +92,9 @@ def test_langgraph_plans_dispatches_centrally_verifies_and_runs_limited_recheck(
 
         assert calls == ["initial", "recheck"]
         assert len(verification_calls) == 2
-        assert result["task_run_status"] == "success"
+        assert result["execution_status"] == "success"
         assert result["report"] == {"ready": True, "unresolved": []}
-        assert scheduler.store.budget_usage("run-1") == {
+        assert executor.store.budget_usage("run-1") == {
             "llm_calls": 3,
             "tool_calls": 0,
             "reserved_tokens": 15,
@@ -106,11 +107,11 @@ def test_langgraph_workflow_requires_explicit_checkpointer(tmp_path: Path):
     async def worker(current_task, task_input, context):
         return {}
 
-    scheduler = CaseTaskScheduler(SQLiteRunStore(tmp_path / "runs.sqlite3"), worker)
+    executor = CaseTaskExecutor(SQLiteRunStore(tmp_path / "runs.sqlite3"), worker)
     with pytest.raises(ValueError, match="explicit LangGraph checkpointer"):
         build_case_workflow_graph(
             planner=lambda state, context: [],
-            scheduler=scheduler,
+            executor=executor,
             verifier=lambda state, context: {"gaps": []},
             recheck_planner=lambda state, context: [],
             recheck_allowed=lambda state: False,
@@ -155,14 +156,14 @@ def test_structured_candidate_events_reach_central_verifier_and_report(tmp_path:
                 "human_review": state["human_review"],
             }
 
-        scheduler = CaseTaskScheduler(
+        executor = CaseTaskExecutor(
             SQLiteRunStore(tmp_path / "runs.sqlite3"),
             worker,
-            config=TaskSchedulerConfig(candidate_limit=1),
+            config=CaseExecutionConfig(candidate_limit=1),
         )
         graph = build_case_workflow_graph(
             planner=planner,
-            scheduler=scheduler,
+            executor=executor,
             verifier=verifier,
             recheck_planner=recheck_planner,
             recheck_allowed=recheck_allowed,
@@ -201,14 +202,14 @@ def test_candidate_event_limit_fails_closed(tmp_path: Path):
         async def planner(state, context):
             return [task("too-many-candidates")]
 
-        scheduler = CaseTaskScheduler(
+        executor = CaseTaskExecutor(
             SQLiteRunStore(tmp_path / "runs.sqlite3"),
             worker,
-            config=TaskSchedulerConfig(candidate_limit=1),
+            config=CaseExecutionConfig(candidate_limit=1),
         )
         graph = build_case_workflow_graph(
             planner=planner,
-            scheduler=scheduler,
+            executor=executor,
             verifier=lambda state, context: {"gaps": []},
             recheck_planner=lambda state, context: [],
             recheck_allowed=lambda state: False,
@@ -230,6 +231,6 @@ def test_candidate_event_limit_fails_closed(tmp_path: Path):
                 },
                 {"configurable": {"thread_id": "case-limit-run-limit"}},
             )
-        assert scheduler.store.get_run("run-limit")["status"] == "failed"
+        assert executor.store.get_run("run-limit")["status"] == "failed"
 
     asyncio.run(scenario())

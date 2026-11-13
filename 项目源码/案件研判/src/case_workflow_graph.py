@@ -1,4 +1,4 @@
-"""LangGraph case flow around the bounded, durable task scheduler.
+"""LangGraph case flow with native dynamic task execution.
 
 The callbacks are explicit application boundaries: they must be backed by the
 case FactPack, the approved tool registry, the central verifier, and the final
@@ -11,11 +11,13 @@ from collections.abc import Awaitable, Callable, Mapping, Sequence
 import inspect
 from typing import Any, TypedDict
 
+from langchain_core.runnables import RunnableConfig
+from copy import deepcopy
 from langgraph.graph import END, START, StateGraph
 
-from .case_task_scheduler import (
+from .case_task_graph import CaseTaskExecutor
+from .case_execution import (
     CaseTaskScope,
-    CaseTaskScheduler,
     InvestigationTask,
     PlanError,
     RunExecutionContext,
@@ -29,8 +31,8 @@ class CaseWorkflowState(TypedDict, total=False):
     case_scope: dict[str, Any]
     initial_tasks: list[dict[str, Any]]
     tasks: list[dict[str, Any]]
-    task_runs: dict[str, dict[str, Any]]
-    task_run_status: str
+    task_outcomes: dict[str, dict[str, Any]]
+    execution_status: str
     candidate_events: list[dict[str, Any]]
     verification: dict[str, Any]
     final_events: list[dict[str, Any]]
@@ -49,7 +51,7 @@ RecheckAllowedCallback = Callable[[Mapping[str, Any]], bool | Awaitable[bool]]
 def build_case_workflow_graph(
     *,
     planner: PlanCallback,
-    scheduler: CaseTaskScheduler,
+    executor: CaseTaskExecutor,
     verifier: VerifyCallback,
     recheck_planner: PlanCallback,
     recheck_allowed: RecheckAllowedCallback,
@@ -61,7 +63,8 @@ def build_case_workflow_graph(
 
     A checkpointer must be supplied explicitly. Use a durable implementation in
     deployment; an in-memory checkpointer is suitable only for isolated tests.
-    The task ledger remains separately persisted by ``CaseTaskScheduler``.
+    Task outcomes and subgraph progress are persisted by this checkpointer.
+    SQLite task rows are a rebuildable API projection.
     """
     if checkpointer is None:
         raise ValueError("an explicit LangGraph checkpointer is required")
@@ -71,46 +74,34 @@ def build_case_workflow_graph(
     async def plan_node(state: CaseWorkflowState) -> dict[str, Any]:
         _require_input(state)
         scope = _scope_from_dict(state["case_scope"])
-        scheduler.prepare_run(state["run_id"], scope)
+        executor.prepare_run(state["run_id"], scope)
         try:
-            tasks = await _invoke(planner, state, scheduler.workflow_context(state["run_id"]))
+            tasks = await _invoke(planner, state, executor.workflow_context(state["run_id"]))
             task_specs = _serialize_tasks(tasks)
-            # The scheduler repeats this validation before creating TaskRuns.
-            from .case_task_scheduler import validate_task_plan
+            # The task graph validates the complete plan again before dispatch.
+            from .case_execution import validate_task_plan
 
-            validate_task_plan(task_specs, max_total_tasks=scheduler.config.max_total_tasks, scope=scope)
+            validate_task_plan(task_specs, max_total_tasks=executor.config.max_total_tasks, scope=scope)
         except Exception:
-            scheduler.store.finish_run(state["run_id"], "failed")
+            executor.store.finish_run(state["run_id"], "failed")
             raise
         serialized = [task.to_dict() for task in task_specs]
         return {"initial_tasks": serialized, "tasks": serialized, "recheck_round": 0}
 
-    async def dispatch_node(state: CaseWorkflowState) -> dict[str, Any]:
-        scope = _scope_from_dict(state["case_scope"])
-        # Recheck planning appends targeted tasks to ``tasks``. Dispatch the
-        # merged plan so a verification gap actually drives another query.
+    async def dispatch_node(state: CaseWorkflowState, config: RunnableConfig) -> dict[str, Any]:
+        config = {**config, "max_concurrency": executor.config.case_task_limit,
+                  "recursion_limit": 4*executor.config.max_total_tasks+20}
         tasks = _serialize_tasks(state.get("tasks") or state.get("initial_tasks", []))
-        result = await scheduler.run(
-            state["run_id"],
-            tasks,
-            state["case_facts"],
-            scope=scope,
-            # The graph owns the terminal state: the report must be persisted
-            # before CaseRunService exposes success to API clients.
-            finalize=False,
-        )
-        task_runs = {
-            task_id: {
-                "task": value["task"].to_dict(),
-                "status": value["status"],
-                "result": value["result"],
-                "error": value["error"],
-                "attempts": value["attempts"],
-                "idempotency_key": value["idempotency_key"],
-            }
-            for task_id, value in result.tasks.items()
-        }
-        return {"task_runs": task_runs, "task_run_status": result.status}
+        outcome = await executor.graph.ainvoke({
+            "run_id": state["run_id"], "tasks": [t.to_dict() for t in tasks],
+            "case_facts": deepcopy(state["case_facts"]), "case_scope": state["case_scope"],
+            "outcomes": {k: {key: v.get(key) for key in ("status", "result", "error")}
+                         for k,v in state.get("task_outcomes", {}).items()},
+        }, config)
+        records = {t.task_id: {"task": t.to_dict(), **outcome["outcomes"][t.task_id],
+                    "idempotency_key": f"{state['run_id']}:{t.task_id}"} for t in tasks}
+        status = "success" if all(v["status"] == "succeeded" for v in records.values()) else "failed"
+        return {"task_outcomes": records, "execution_status": status}
 
     async def candidate_events_node(state: CaseWorkflowState) -> dict[str, Any]:
         """Collect only explicitly structured Worker candidate events.
@@ -120,10 +111,10 @@ def build_case_workflow_graph(
         as a structured, traceable result; this node applies the frozen run
         limit before the central verifier sees the candidates.
         """
-        scheduler.store.record_event(state["run_id"], "candidate_events", "started")
+        executor.store.record_event(state["run_id"], "candidate_events", "started")
         try:
             events: list[dict[str, Any]] = []
-            for task_id, record in sorted(state.get("task_runs", {}).items()):
+            for task_id, record in sorted(state.get("task_outcomes", {}).items()):
                 if not isinstance(record, Mapping) or record.get("status") != "succeeded":
                     continue
                 result = record.get("result")
@@ -145,26 +136,26 @@ def build_case_workflow_graph(
                         raise PlanError(f"task {task_id} candidate events must be non-empty mappings")
                     events.append(dict(event))
 
-            if len(events) > scheduler.config.candidate_limit:
+            if len(events) > executor.config.candidate_limit:
                 raise PlanError(
                     "candidate event limit exceeded "
-                    f"({len(events)}/{scheduler.config.candidate_limit})"
+                    f"({len(events)}/{executor.config.candidate_limit})"
                 )
-            scheduler.store.record_event(
+            executor.store.record_event(
                 state["run_id"],
                 "candidate_events",
                 "succeeded",
-                {"count": len(events), "limit": scheduler.config.candidate_limit},
+                {"count": len(events), "limit": executor.config.candidate_limit},
             )
             return {"candidate_events": events}
         except Exception:
-            scheduler.store.record_event(state["run_id"], "candidate_events", "failed")
-            scheduler.store.finish_run(state["run_id"], "failed")
+            executor.store.record_event(state["run_id"], "candidate_events", "failed")
+            executor.store.finish_run(state["run_id"], "failed")
             raise
 
     async def verify_node(state: CaseWorkflowState) -> dict[str, Any]:
         try:
-            outcome = await _invoke(verifier, state, scheduler.workflow_context(state["run_id"]))
+            outcome = await _invoke(verifier, state, executor.workflow_context(state["run_id"]))
             if not isinstance(outcome, Mapping):
                 raise TypeError("central verifier must return a mapping")
             if "gaps" not in outcome or not isinstance(outcome["gaps"], Sequence) or isinstance(outcome["gaps"], (str, bytes)):
@@ -177,18 +168,19 @@ def build_case_workflow_graph(
                 "human_review": human_review,
             }
         except Exception:
-            scheduler.store.finish_run(state["run_id"], "failed")
+            executor.store.finish_run(state["run_id"], "failed")
             raise
 
     async def plan_rechecks_node(state: CaseWorkflowState) -> dict[str, Any]:
         try:
             scope = _scope_from_dict(state["case_scope"])
-            proposed = await _invoke(recheck_planner, state, scheduler.workflow_context(state["run_id"]))
+            proposed = await _invoke(recheck_planner, state, executor.workflow_context(state["run_id"]))
             tasks = _serialize_tasks(proposed)
             round_number = int(state.get("recheck_round", 0)) + 1
             if tasks:
-                scheduler.append_recheck_tasks(state["run_id"], tasks, scope=scope)
                 merged = [*state.get("tasks", []), *(task.to_dict() for task in tasks)]
+                from .case_execution import validate_task_plan
+                validate_task_plan(_serialize_tasks(merged), max_total_tasks=executor.config.max_total_tasks, scope=scope)
             else:
                 merged = list(state.get("tasks", []))
             return {
@@ -197,25 +189,17 @@ def build_case_workflow_graph(
                 "recheck_added": bool(tasks),
             }
         except Exception:
-            scheduler.store.finish_run(state["run_id"], "failed")
+            executor.store.finish_run(state["run_id"], "failed")
             raise
 
     async def summarize_node(state: CaseWorkflowState) -> dict[str, Any]:
         try:
-            report = await _invoke(summarizer, state, scheduler.workflow_context(state["run_id"]))
+            report = await _invoke(summarizer, state, executor.workflow_context(state["run_id"]))
             if not isinstance(report, Mapping):
                 raise TypeError("summarizer must return a mapping")
-            # Persist the report before publishing terminal success.  API
-            # clients may observe the status immediately after the graph
-            # finishes, so success must imply that the report is readable.
-            scheduler.store.save_report(state["run_id"], report)
-            scheduler.store.finish_run(
-                state["run_id"],
-                "success" if state.get("task_run_status") == "success" else "failed",
-            )
             return {"report": dict(report)}
         except Exception:
-            scheduler.store.finish_run(state["run_id"], "failed")
+            executor.store.finish_run(state["run_id"], "failed")
             raise
 
     async def route_after_verify(state: CaseWorkflowState) -> str:
@@ -228,7 +212,7 @@ def build_case_workflow_graph(
                 return "plan_rechecks"
             return "summarize"
         except Exception:
-            scheduler.store.finish_run(state["run_id"], "failed")
+            executor.store.finish_run(state["run_id"], "failed")
             raise
 
     builder = StateGraph(CaseWorkflowState)

@@ -61,3 +61,11 @@ Snapshot
 默认公开服务还接受任务 payload 中的结构化 `verification.gaps` 作为合成核验边界，
 用来演示缺口转补证任务和再次核验；这不代表公开版包含生产 Verifier 或真实补证结果。
 
+
+## 案件任务执行入口
+
+- `src/case_task_graph.py`：业务就绪判断、Send、按 Task ID 合并终态结果；不读取任务查询表决定执行。
+- `src/case_worker_subgraph.py`：调用级隔离、原生 RetryPolicy / timeout / error_handler；运行上下文通过 Runtime 注入。
+- `src/case_execution.py`：任务与范围契约、原子预算、外部幂等操作及可重建查询投影。
+- `src/case_run_service.py`：单事件循环承载案件；启动恢复 native-v2 未完成案件、取消、报告发布与 SSE。
+- 恢复与部署边界统一见 `docs/execution/native_task_runtime.md`。案件任务只有原生图执行入口。

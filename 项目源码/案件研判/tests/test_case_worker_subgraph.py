@@ -2,8 +2,9 @@ import asyncio
 from pathlib import Path
 
 import pytest
+import threading
 
-from src.case_task_scheduler import (
+from src.case_execution import (
     BudgetLimitExceeded,
     CaseTaskScope,
     ExternalOperationUncertain,
@@ -11,9 +12,62 @@ from src.case_task_scheduler import (
     SharedResourceLimits,
     SQLiteRunStore,
     TaskExecutionContext,
-    TaskSchedulerConfig,
+    CaseExecutionConfig,
 )
 from src.case_worker_subgraph import SupplementWorkerSubgraph
+
+
+def test_cancelled_blocking_query_keeps_resource_permit_until_thread_finishes(tmp_path):
+    async def scenario():
+        task = InvestigationTask("query", "query", entity_ids=("person-1",),
+                                 basis_fact_ids=("fact-1",), allowed_tools=("lookup",))
+        context = _context(tmp_path, "blocking", task)
+        context.resources = SharedResourceLimits(db_query_cap=1)
+        first_entered, finish_first, second_entered = threading.Event(), threading.Event(), threading.Event()
+
+        def first_query():
+            first_entered.set()
+            assert finish_first.wait(timeout=5)
+            return "first"
+
+        def second_query():
+            second_entered.set()
+            return "second"
+
+        first = asyncio.create_task(context.tool_call(first_query, tool_name="lookup"))
+        second = None
+        try:
+            assert await asyncio.to_thread(first_entered.wait, 5)
+            first.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await first
+            second = asyncio.create_task(context.tool_call(second_query, tool_name="lookup"))
+            await asyncio.sleep(.05)
+            assert not second_entered.is_set()
+            assert context.store.budget_usage("blocking")["tool_calls"] == 1
+            finish_first.set()
+            assert await asyncio.wait_for(second, timeout=5) == "second"
+            assert context.store.budget_usage("blocking")["tool_calls"] == 2
+        finally:
+            finish_first.set()
+            if second is not None:
+                await second
+    asyncio.run(scenario())
+
+
+def test_cancel_before_external_dispatch_does_not_spend_budget_or_write(tmp_path):
+    async def scenario():
+        task = InvestigationTask("write", "write", entity_ids=("person-1",),
+                                 basis_fact_ids=("fact-1",), allowed_tools=("lookup",))
+        context = _context(tmp_path, "cancel-write", task)
+        context.store.request_cancel(context.run_id)
+        calls = []
+        with pytest.raises(asyncio.CancelledError):
+            await context.idempotent_tool_call(lambda **kwargs: calls.append(kwargs),
+                                               tool_name="lookup", operation="write")
+        assert calls == []
+        assert context.store.budget_usage(context.run_id)["tool_calls"] == 0
+    asyncio.run(scenario())
 
 
 def _context(tmp_path: Path, run_id: str, task: InvestigationTask) -> TaskExecutionContext:
@@ -23,8 +77,8 @@ def _context(tmp_path: Path, run_id: str, task: InvestigationTask) -> TaskExecut
         fact_ids=frozenset({"fact-1"}),
         allowed_tools=frozenset({"lookup"}),
     )
-    config = TaskSchedulerConfig()
-    store.start_run(run_id, [task], config, scope)
+    config = CaseExecutionConfig()
+    store.prepare_task_projection(run_id, [task], config, scope)
     return TaskExecutionContext(
         run_id=run_id,
         task=task,
@@ -61,12 +115,12 @@ def test_reusable_supplement_subgraph_keeps_task_contexts_isolated(tmp_path: Pat
 
         graph = SupplementWorkerSubgraph(worker)
         result_a, result_b = await asyncio.gather(
-            graph(task_a, {"task": task_a.to_dict()}, _context(tmp_path, "run-a", task_a)),
-            graph(task_b, {"task": task_b.to_dict()}, _context(tmp_path, "run-b", task_b)),
+            graph.graph.ainvoke({"task": task_a.to_dict(), "task_input": {"task": task_a.to_dict()}}, context=_context(tmp_path, "run-a", task_a)),
+            graph.graph.ainvoke({"task": task_b.to_dict(), "task_input": {"task": task_b.to_dict()}}, context=_context(tmp_path, "run-b", task_b)),
         )
 
-        assert result_a == {"task_id": "a", "question": "question-a", "run_id": "run-a"}
-        assert result_b == {"task_id": "b", "question": "question-b", "run_id": "run-b"}
+        assert result_a["result"] == {"task_id": "a", "question": "question-a", "run_id": "run-a"}
+        assert result_b["result"] == {"task_id": "b", "question": "question-b", "run_id": "run-b"}
 
     asyncio.run(scenario())
 
@@ -145,13 +199,13 @@ def test_idempotent_budget_rejection_does_not_poison_effect_state(tmp_path: Path
             allowed_tools=("lookup",),
         )
         store = SQLiteRunStore(tmp_path / "runs.sqlite3")
-        config = TaskSchedulerConfig(max_tool_calls=1)
+        config = CaseExecutionConfig(max_tool_calls=1)
         scope = CaseTaskScope(
             entity_ids=frozenset({"person-1"}),
             fact_ids=frozenset({"fact-1"}),
             allowed_tools=frozenset({"lookup"}),
         )
-        store.start_run("run-budget", [task], config, scope)
+        store.prepare_task_projection("run-budget", [task], config, scope)
         context = TaskExecutionContext(
             run_id="run-budget",
             task=task,

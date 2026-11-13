@@ -8,6 +8,8 @@ authorized planner, database adapters, verifier, and report builder.
 from __future__ import annotations
 
 from pathlib import Path
+from contextlib import asynccontextmanager
+import asyncio
 from typing import Any
 from uuid import uuid4
 
@@ -17,11 +19,11 @@ from pydantic import BaseModel, Field
 
 from .case_run_service import CaseRunService
 from .candidate_events import CandidateEventBuilder
-from .case_task_scheduler import (
+from .case_execution import (
     InvestigationTask,
     SQLiteRunStore,
     TaskExecutionContext,
-    TaskSchedulerConfig,
+    CaseExecutionConfig,
 )
 from .directed_supplement import build_recheck_tasks, has_actionable_gaps
 
@@ -42,8 +44,14 @@ class CaseRunRequest(BaseModel):
 
 
 def create_app(service: CaseRunService | None = None) -> FastAPI:
-    app = FastAPI(title="Model Insight Agent Case Runs", version="0.1.0")
     active_service = service or _build_default_service()
+
+    @asynccontextmanager
+    async def lifespan(app):
+        yield
+        await asyncio.to_thread(active_service.close)
+
+    app = FastAPI(title="Model Insight Agent Case Runs", version="0.1.0", lifespan=lifespan)
 
     @app.get("/health")
     async def health() -> dict[str, str]:
@@ -77,6 +85,13 @@ def create_app(service: CaseRunService | None = None) -> FastAPI:
         record = active_service.status(run_id)
         return {"run_id": run_id, "cancel_requested": accepted, "status": record["status"]}
 
+    @app.post("/v1/case-runs/{run_id}/resume", status_code=202)
+    async def resume_case(run_id: str):
+        try:
+            return active_service.resume(run_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
     @app.get("/v1/case-runs/{run_id}/report")
     async def get_case_report(run_id: str) -> dict[str, Any]:
         record = active_service.status(run_id)
@@ -106,8 +121,8 @@ def create_app(service: CaseRunService | None = None) -> FastAPI:
 
 def _build_default_service(storage_root: Path | str | None = None) -> CaseRunService:
     root = Path(storage_root).resolve() if storage_root is not None else Path(__file__).resolve().parent.parent
-    store = SQLiteRunStore(root / "runtime" / "case_runs.sqlite3")
-    config = TaskSchedulerConfig()
+    store = SQLiteRunStore(root / "runtime" / "case_runtime.sqlite3")
+    config = CaseExecutionConfig()
     candidate_builder = CandidateEventBuilder(max_events=config.candidate_limit)
 
     async def worker(task: InvestigationTask, task_input: dict[str, Any], context: TaskExecutionContext) -> dict[str, Any]:
@@ -153,15 +168,15 @@ def _build_default_service(storage_root: Path | str | None = None) -> CaseRunSer
     async def verifier(state, context):
         gaps: list[dict[str, Any]] = []
         verified_events: list[dict[str, Any]] = []
-        task_runs = state.get("task_runs", {})
+        task_outcomes = state.get("task_outcomes", {})
         resolved_gap_keys: set[str] = set()
-        for task_id, record in task_runs.items():
+        for task_id, record in task_outcomes.items():
             task = record.get("task") if isinstance(record, dict) else None
             payload = task.get("payload") if isinstance(task, dict) else None
             if record.get("status") == "succeeded" and isinstance(payload, dict):
                 if payload.get("source") == "verification_gap":
                     resolved_gap_keys.add(_gap_key(payload.get("gap"), task_id))
-        for task_id, record in task_runs.items():
+        for task_id, record in task_outcomes.items():
             if record.get("status") != "succeeded":
                 gaps.append({"task_id": task_id, "reason": "task execution failed"})
                 continue
@@ -197,7 +212,7 @@ def _build_default_service(storage_root: Path | str | None = None) -> CaseRunSer
         return {
             "case_id": state["case_id"],
             "run_id": state["run_id"],
-            "task_runs": state.get("task_runs", {}),
+            "task_outcomes": state.get("task_outcomes", {}),
             "verification": state.get("verification", {}),
             "candidate_events": state.get("candidate_events", []),
             "final_events": state.get("final_events", []),

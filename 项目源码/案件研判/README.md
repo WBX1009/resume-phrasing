@@ -51,8 +51,7 @@
 ## Case run API
 
 `src.case_api:app` 提供 `POST /v1/case-runs`、状态/取消/报告端点和
-`GET /v1/case-runs/{run_id}/events` SSE。任务台账写入 SQLite，LangGraph
-检查点默认写入独立 SQLite 文件；真实 Planner、Worker、Verifier、GaussDB
+`GET /v1/case-runs/{run_id}/events` SSE，并提供 `POST /v1/case-runs/{run_id}/resume`。任务执行、重试与恢复由 LangGraph 原生子图负责；SQLite `case_task_outcomes` 任务行是查询投影，检查点默认写入独立 SQLite 文件；真实 Planner、Worker、Verifier、GaussDB
 连接和报告投影通过 `CaseRunService` 注入。公开版的默认服务不包含生产数据库、
 专家标注或线上指标。任务可以显式提供候选风险疑点，也可以把脱敏 fact pack 和
 结构化 model clues 交给 `src.candidate_events.py` 生成带来源、事实引用和风险
@@ -89,3 +88,13 @@ python -m venv .venv
 
 先让模型阅读 `AI_CONTEXT.md`，再指定要分析的模块或设计问题。涉及代码修改时，要求它先说明事实边界、输入输出契约、测试影响和是否需要真实数据；不要让它猜测私有数据库内容或凭空补齐业务指标。
 
+
+## 原生任务运行机制
+
+案件图的 dispatch 调用 LangGraph 任务子图：`resolve_ready → Send(worker) → resolve_ready`。
+业务层校验任务及依赖，框架负责并发执行、重试、超时和检查点恢复。结果按 Task ID 合并，
+失败的前置任务阻断其全部后代；独立任务继续执行。采用 superstep 汇合语义。
+
+`src/case_execution.py` 保存业务契约、原子预算、外部操作幂等和 API 投影；
+`src/case_task_graph.py` 定义原生任务子图，任务入口只有这一条 LangGraph 路径。详细边界、恢复方式与验证见
+[原生任务运行说明](docs/execution/native_task_runtime.md)。

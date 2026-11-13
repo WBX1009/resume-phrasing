@@ -1,9 +1,6 @@
-"""Bounded, dependency-aware case task execution with a durable run ledger.
+"""Business task contracts, atomic budgets, effects and API projections.
 
-This module is deliberately framework-neutral. A LangGraph Worker subgraph can
-be supplied as the async worker callback; the scheduler owns DAG validation,
-per-case active-task limits, global in-process model/database gates, isolated
-inputs, shared durable budgets, and task-level restart recovery.
+Execution and recovery belong to LangGraph, never to the task projection.
 """
 
 from __future__ import annotations
@@ -13,6 +10,7 @@ from collections.abc import Awaitable, Callable, Mapping, Sequence
 from copy import deepcopy
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
+from functools import partial
 import hashlib
 import inspect
 import json
@@ -27,6 +25,10 @@ class PlanError(ValueError):
 
 class BudgetLimitExceeded(RuntimeError):
     """A run-level LLM/tool/token budget has been exhausted."""
+
+
+class TaskExecutionError(RuntimeError):
+    """A known, terminal business task failure, distinct from a program defect."""
 
 
 class ExternalOperationUncertain(RuntimeError):
@@ -138,7 +140,7 @@ class InvestigationTask:
 
 
 @dataclass(frozen=True)
-class TaskSchedulerConfig:
+class CaseExecutionConfig:
     case_task_limit: int = 2
     server_task_cap: int = 4
     max_total_tasks: int = 100
@@ -146,6 +148,8 @@ class TaskSchedulerConfig:
     max_tool_calls: int = 200
     max_reserved_tokens: int = 2_000_000
     candidate_limit: int = 100
+    max_attempts: int = 3
+    task_timeout: int = 120
 
     def __post_init__(self) -> None:
         values = {
@@ -156,6 +160,8 @@ class TaskSchedulerConfig:
             "max_tool_calls": self.max_tool_calls,
             "max_reserved_tokens": self.max_reserved_tokens,
             "candidate_limit": self.candidate_limit,
+            "max_attempts": self.max_attempts,
+            "task_timeout": self.task_timeout,
         }
         for name, value in values.items():
             if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
@@ -176,7 +182,7 @@ class SharedResourceLimits:
 
 
 class SQLiteRunStore:
-    """Persist immutable plans, task outputs, statuses, and atomic run budgets."""
+    """Persist admissions, API projections, atomic budgets and external effect records."""
 
     _budget_caps = {
         "llm_calls": "max_llm_calls",
@@ -190,11 +196,14 @@ class SQLiteRunStore:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as connection:
+            # Detect incompatible databases; do not carry old task-ledger migrations.
+            columns = {row[1] for row in connection.execute("PRAGMA table_info(case_runs)")}
+            if columns and "plan_hash" in columns:
+                raise ValueError("unsupported run database schema; use a fresh runtime database")
             connection.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS case_runs (
                     run_id TEXT PRIMARY KEY,
-                    plan_hash TEXT NOT NULL,
                     scope_hash TEXT NOT NULL,
                     config_json TEXT NOT NULL,
                     status TEXT NOT NULL,
@@ -207,7 +216,7 @@ class SQLiteRunStore:
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
-                CREATE TABLE IF NOT EXISTS case_task_runs (
+                CREATE TABLE IF NOT EXISTS case_task_outcomes (
                     run_id TEXT NOT NULL REFERENCES case_runs(run_id),
                     task_id TEXT NOT NULL,
                     spec_json TEXT NOT NULL,
@@ -227,6 +236,11 @@ class SQLiteRunStore:
                     payload_json TEXT,
                     created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS case_admissions (
+                    run_id TEXT PRIMARY KEY REFERENCES case_runs(run_id),
+                    input_json TEXT NOT NULL,
+                    graph_version TEXT NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS case_effects (
                     run_id TEXT NOT NULL REFERENCES case_runs(run_id),
                     operation_key TEXT NOT NULL,
@@ -238,18 +252,6 @@ class SQLiteRunStore:
                 );
                 """
             )
-            columns = {row[1] for row in connection.execute("PRAGMA table_info(case_runs)")}
-            if "scope_hash" not in columns:
-                # Old runs lack a frozen authorization scope and must not be
-                # resumed under a scope that was never recorded.
-                connection.execute("ALTER TABLE case_runs ADD COLUMN scope_hash TEXT NOT NULL DEFAULT 'unverified'")
-            if "cancel_requested" not in columns:
-                connection.execute("ALTER TABLE case_runs ADD COLUMN cancel_requested INTEGER NOT NULL DEFAULT 0")
-            if "report_json" not in columns:
-                connection.execute("ALTER TABLE case_runs ADD COLUMN report_json TEXT")
-            if "error" not in columns:
-                connection.execute("ALTER TABLE case_runs ADD COLUMN error TEXT")
-
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.path, timeout=30, isolation_level=None)
         connection.row_factory = sqlite3.Row
@@ -257,85 +259,61 @@ class SQLiteRunStore:
         connection.execute("PRAGMA busy_timeout = 30000")
         return connection
 
-    def start_run(
-        self,
-        run_id: str,
-        tasks: Sequence[InvestigationTask],
-        config: TaskSchedulerConfig,
-        scope: CaseTaskScope,
-    ) -> None:
+    def prepare_task_projection(self, run_id, tasks, config, scope):
+        """Initialize a plan projection; never infer recovery from task rows."""
         validate_task_plan(tasks, max_total_tasks=config.max_total_tasks, scope=scope)
-        plan_hash = _digest([task.to_dict() for task in tasks])
-        scope_hash = _digest(scope.to_dict())
-        config_json = _json(asdict(config))
-        now = _now()
+        self.prepare_run(run_id, config, scope)
+        with self._connect() as connection:
+            for task in tasks:
+                connection.execute(
+                    "INSERT INTO case_task_outcomes(run_id,task_id,spec_json,status,idempotency_key,updated_at) VALUES(?,?,?,'pending',?,?) ON CONFLICT(run_id,task_id) DO UPDATE SET spec_json=excluded.spec_json,idempotency_key=excluded.idempotency_key",
+                    (run_id, task.task_id, _json(task.to_dict()), f"{run_id}:{task.task_id}", _now()),
+                )
+
+    def admit(self, state, config, scope):
+        """Atomically persist admission and frozen limits before any execution."""
+        encoded = _json(state)
+        run_id = state["run_id"]
+        scope_hash, config_json = _digest(scope.to_dict()), _json(asdict(config))
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
-            row = connection.execute("SELECT plan_hash, scope_hash, config_json FROM case_runs WHERE run_id = ?", (run_id,)).fetchone()
-            if row is not None and (row["scope_hash"] != scope_hash or row["config_json"] != config_json):
-                connection.rollback()
+            run = connection.execute("SELECT scope_hash,config_json FROM case_runs WHERE run_id=?", (run_id,)).fetchone()
+            admission = connection.execute("SELECT input_json,graph_version FROM case_admissions WHERE run_id=?", (run_id,)).fetchone()
+            if run and not admission:
+                raise ValueError("legacy run requires its original application version")
+            if run and (run[0] != scope_hash or run[1] != config_json):
+                raise ValueError("run_id is already bound to a different scope or budget configuration")
+            if admission and (admission[0] != encoded or admission[1] != "native-v2"):
                 raise ValueError("run_id is already bound to a different plan, scope, or budget configuration")
-            if row is None:
-                connection.execute(
-                    "INSERT INTO case_runs(run_id, plan_hash, scope_hash, config_json, status, created_at, updated_at) VALUES(?, ?, ?, ?, 'running', ?, ?)",
-                    (run_id, plan_hash, scope_hash, config_json, now, now),
-                )
-                self._insert_plan_tasks(connection, run_id, tasks, now)
-            elif row["plan_hash"] == "planning":
-                existing_count = int(connection.execute(
-                    "SELECT COUNT(*) FROM case_task_runs WHERE run_id = ?", (run_id,)
-                ).fetchone()[0])
-                if existing_count:
-                    connection.rollback()
-                    raise ValueError("planning run unexpectedly already contains TaskRun records")
-                connection.execute(
-                    "UPDATE case_runs SET plan_hash = ?, status = 'running', updated_at = ? WHERE run_id = ?",
-                    (plan_hash, now, run_id),
-                )
-                self._insert_plan_tasks(connection, run_id, tasks, now)
-            else:
-                # A verification round may have appended validated recheck
-                # tasks through ``add_tasks`` before dispatching the merged
-                # plan. In that case the persisted task set is authoritative;
-                # accept the new hash only when every task specification is
-                # identical and no task was silently replaced.
-                existing_rows = connection.execute(
-                    "SELECT task_id, spec_json FROM case_task_runs WHERE run_id = ?",
-                    (run_id,),
-                ).fetchall()
-                existing_specs = {
-                    row_item["task_id"]: json.loads(row_item["spec_json"])
-                    for row_item in existing_rows
-                }
-                incoming_specs = {task.task_id: task.to_dict() for task in tasks}
-                incoming_is_compatible = all(
-                    task_id in existing_specs and existing_specs[task_id] == spec
-                    for task_id, spec in incoming_specs.items()
-                )
-                if not incoming_is_compatible:
-                    connection.rollback()
-                    raise ValueError("run_id is already bound to a different plan, scope, or budget configuration")
-                if existing_specs == incoming_specs:
-                    connection.execute(
-                        "UPDATE case_runs SET plan_hash = ?, status = 'running', cancel_requested = 0, updated_at = ? WHERE run_id = ?",
-                        (plan_hash, now, run_id),
-                    )
-                else:
-                    # The durable store already contains appended recheck
-                    # tasks. The caller may still pass the original plan;
-                    # keep the persisted expanded plan hash authoritative.
-                    connection.execute(
-                        "UPDATE case_runs SET status = 'running', cancel_requested = 0, updated_at = ? WHERE run_id = ?",
-                        (now, run_id),
-                    )
-                connection.execute(
-                    "UPDATE case_task_runs SET status = 'pending', error = NULL, updated_at = ? WHERE run_id = ? AND status = 'running'",
-                    (now, run_id),
-                )
-                connection.execute("UPDATE case_runs SET status = 'running', cancel_requested = 0, updated_at = ? WHERE run_id = ?", (now, run_id))
+            now = _now()
+            connection.execute(
+                "INSERT OR IGNORE INTO case_runs(run_id,scope_hash,config_json,status,created_at,updated_at) VALUES(?,?,?,'running',?,?)",
+                (run_id, scope_hash, config_json, now, now),
+            )
+            connection.execute("INSERT OR IGNORE INTO case_admissions VALUES(?,?,?)", (run_id, encoded, "native-v2"))
             connection.commit()
 
-    def prepare_run(self, run_id: str, config: TaskSchedulerConfig, scope: CaseTaskScope) -> None:
+    def admission(self, run_id):
+        with self._connect() as connection:
+            row = connection.execute("SELECT input_json,graph_version FROM case_admissions WHERE run_id=?", (run_id,)).fetchone()
+        if not row or row[1] != "native-v2":
+            raise ValueError("run has no native-v2 admission; legacy runs require their original application version")
+        return json.loads(row[0])
+
+    def mark_running(self, run_id):
+        with self._connect() as connection:
+            connection.execute("UPDATE case_runs SET status='running',cancel_requested=0,error=NULL,updated_at=? WHERE run_id=?", (_now(),run_id))
+
+    def project(self, run_id, tasks, outcomes, config, scope):
+        self.prepare_task_projection(run_id, tasks, config, scope)
+        for task_id, record in outcomes.items():
+            self.record_task_status(run_id, task_id, record["status"], result=record.get("result"), error=record.get("error"))
+
+    def publish_report(self, run_id, report, status):
+        with self._connect() as connection:
+            connection.execute("UPDATE case_runs SET report_json=?,status=?,error=NULL,updated_at=? WHERE run_id=?", (_json(report),status,_now(),run_id))
+
+    def prepare_run(self, run_id: str, config: CaseExecutionConfig, scope: CaseTaskScope) -> None:
         """Create the immutable budget/scope ledger before any graph LLM call."""
         if not isinstance(run_id, str) or not run_id.strip():
             raise ValueError("run_id must be a non-empty string")
@@ -344,10 +322,10 @@ class SQLiteRunStore:
         now = _now()
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
-            row = connection.execute("SELECT plan_hash, scope_hash, config_json FROM case_runs WHERE run_id = ?", (run_id,)).fetchone()
+            row = connection.execute("SELECT scope_hash, config_json FROM case_runs WHERE run_id = ?", (run_id,)).fetchone()
             if row is None:
                 connection.execute(
-                    "INSERT INTO case_runs(run_id, plan_hash, scope_hash, config_json, status, created_at, updated_at) VALUES(?, 'planning', ?, ?, 'running', ?, ?)",
+                    "INSERT INTO case_runs(run_id, scope_hash, config_json, status, created_at, updated_at) VALUES(?, ?, ?, 'running', ?, ?)",
                     (run_id, scope_hash, config_json, now, now),
                 )
             elif row["scope_hash"] != scope_hash or row["config_json"] != config_json:
@@ -355,22 +333,9 @@ class SQLiteRunStore:
                 raise ValueError("run_id is already bound to a different scope or budget configuration")
             connection.commit()
 
-    @staticmethod
-    def _insert_plan_tasks(
-        connection: sqlite3.Connection,
-        run_id: str,
-        tasks: Sequence[InvestigationTask],
-        now: str,
-    ) -> None:
-        for task in tasks:
-            connection.execute(
-                "INSERT INTO case_task_runs(run_id, task_id, spec_json, status, idempotency_key, updated_at) VALUES(?, ?, ?, 'pending', ?, ?)",
-                (run_id, task.task_id, _json(task.to_dict()), f"{run_id}:{task.task_id}", now),
-            )
-
-    def load_tasks(self, run_id: str) -> dict[str, dict[str, Any]]:
+    def load_task_projection(self, run_id: str) -> dict[str, dict[str, Any]]:
         with self._connect() as connection:
-            rows = connection.execute("SELECT * FROM case_task_runs WHERE run_id = ? ORDER BY task_id", (run_id,)).fetchall()
+            rows = connection.execute("SELECT * FROM case_task_outcomes WHERE run_id = ? ORDER BY task_id", (run_id,)).fetchall()
         return {
             row["task_id"]: {
                 "task": InvestigationTask.from_dict(json.loads(row["spec_json"])),
@@ -383,7 +348,7 @@ class SQLiteRunStore:
             for row in rows
         }
 
-    def save_task(
+    def record_task_status(
         self,
         run_id: str,
         task_id: str,
@@ -400,47 +365,17 @@ class SQLiteRunStore:
             connection.execute("BEGIN IMMEDIATE")
             if increment_attempt:
                 connection.execute(
-                    "UPDATE case_task_runs SET status = ?, result_json = ?, error = ?, attempts = attempts + 1, updated_at = ? WHERE run_id = ? AND task_id = ?",
+                    "UPDATE case_task_outcomes SET status = ?, result_json = ?, error = ?, attempts = attempts + 1, updated_at = ? WHERE run_id = ? AND task_id = ?",
                     (status, result_json, error, _now(), run_id, task_id),
                 )
             else:
                 connection.execute(
-                    "UPDATE case_task_runs SET status = ?, result_json = ?, error = ?, updated_at = ? WHERE run_id = ? AND task_id = ?",
+                    "UPDATE case_task_outcomes SET status = ?, result_json = ?, error = ?, updated_at = ? WHERE run_id = ? AND task_id = ?",
                     (status, result_json, error, _now(), run_id, task_id),
                 )
             connection.commit()
 
-    def add_tasks(
-        self,
-        run_id: str,
-        tasks: Sequence[InvestigationTask],
-        max_total_tasks: int,
-        scope: CaseTaskScope,
-    ) -> None:
-        now = _now()
-        with self._connect() as connection:
-            connection.execute("BEGIN IMMEDIATE")
-            run = connection.execute("SELECT scope_hash FROM case_runs WHERE run_id = ?", (run_id,)).fetchone()
-            if run is None:
-                connection.rollback()
-                raise KeyError(f"unknown run_id: {run_id}")
-            if run["scope_hash"] != _digest(scope.to_dict()):
-                connection.rollback()
-                raise ValueError("recheck scope differs from the scope frozen for this run")
-            current = int(connection.execute("SELECT COUNT(*) FROM case_task_runs WHERE run_id = ?", (run_id,)).fetchone()[0])
-            existing_rows = connection.execute(
-                "SELECT spec_json FROM case_task_runs WHERE run_id = ?", (run_id,)
-            ).fetchall()
-            existing_tasks = [InvestigationTask.from_dict(json.loads(row["spec_json"])) for row in existing_rows]
-            validate_task_plan([*existing_tasks, *tasks], max_total_tasks=max_total_tasks, scope=scope)
-            for task in tasks:
-                connection.execute(
-                    "INSERT INTO case_task_runs(run_id, task_id, spec_json, status, idempotency_key, updated_at) VALUES(?, ?, ?, 'pending', ?, ?)",
-                    (run_id, task.task_id, _json(task.to_dict()), f"{run_id}:{task.task_id}", now),
-                )
-            connection.commit()
-
-    def reserve(self, run_id: str, resource: str, amount: int, config: TaskSchedulerConfig) -> int:
+    def reserve(self, run_id: str, resource: str, amount: int, config: CaseExecutionConfig) -> int:
         if resource not in self._budget_caps:
             raise ValueError(f"unknown budget resource: {resource}")
         if not isinstance(amount, int) or isinstance(amount, bool) or amount <= 0:
@@ -464,7 +399,7 @@ class SQLiteRunStore:
             connection.commit()
             return updated
 
-    def reserve_llm(self, run_id: str, max_output_tokens: int, config: TaskSchedulerConfig) -> None:
+    def reserve_llm(self, run_id: str, max_output_tokens: int, config: CaseExecutionConfig) -> None:
         if not isinstance(max_output_tokens, int) or isinstance(max_output_tokens, bool) or max_output_tokens <= 0:
             raise ValueError("max_output_tokens must be a positive integer")
         with self._connect() as connection:
@@ -530,14 +465,6 @@ class SQLiteRunStore:
             raise KeyError(f"unknown run_id: {run_id}")
         return bool(row["cancel_requested"])
 
-    def save_report(self, run_id: str, report: Mapping[str, Any]) -> None:
-        report_json = _json(dict(report))
-        with self._connect() as connection:
-            connection.execute(
-                "UPDATE case_runs SET report_json = ?, updated_at = ? WHERE run_id = ?",
-                (report_json, _now(), run_id),
-            )
-
     def load_report(self, run_id: str) -> dict[str, Any] | None:
         with self._connect() as connection:
             row = connection.execute(
@@ -554,10 +481,13 @@ class SQLiteRunStore:
             ).fetchone()
         if row is None:
             return None
-        tasks = self.load_tasks(run_id)
+        # Status/recovery must not deserialize a possibly stale task projection.
+        with self._connect() as connection:
+            task_counts = connection.execute(
+                "SELECT status,COUNT(*) FROM case_task_outcomes WHERE run_id=? GROUP BY status", (run_id,)
+            ).fetchall()
         counts = {status: 0 for status in ("pending", "running", "succeeded", "failed", "blocked")}
-        for task in tasks.values():
-            counts[task["status"]] = counts.get(task["status"], 0) + 1
+        counts.update({status: count for status, count in task_counts})
         return {
             "run_id": run_id,
             "status": row["status"],
@@ -566,7 +496,7 @@ class SQLiteRunStore:
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
             "task_counts": counts,
-            "task_total": len(tasks),
+            "task_total": sum(counts.values()),
             "budget": {
                 "llm_calls": int(row["llm_calls"]),
                 "tool_calls": int(row["tool_calls"]),
@@ -684,7 +614,7 @@ class TaskExecutionContext:
     task: InvestigationTask
     idempotency_key: str
     store: SQLiteRunStore
-    config: TaskSchedulerConfig
+    config: CaseExecutionConfig
     resources: SharedResourceLimits
 
     async def llm_call(
@@ -696,16 +626,23 @@ class TaskExecutionContext:
     ) -> Any:
         if not isinstance(max_output_tokens, int) or isinstance(max_output_tokens, bool) or max_output_tokens <= 0:
             raise ValueError("max_output_tokens must be a positive integer")
-        self.store.reserve_llm(self.run_id, max_output_tokens, self.config)
+        if self.store.is_cancel_requested(self.run_id):
+            raise asyncio.CancelledError
         async with self.resources.llm:
+            if self.store.is_cancel_requested(self.run_id):
+                raise asyncio.CancelledError
+            self.store.reserve_llm(self.run_id, max_output_tokens, self.config)
             return await _invoke_async(callback, *args, **kwargs)
 
     async def tool_call(self, callback: Callable[..., Any], *args: Any, tool_name: str, **kwargs: Any) -> Any:
         if not isinstance(tool_name, str) or tool_name not in self.task.allowed_tools:
             raise PlanError(f"task {self.task.task_id} attempted a non-whitelisted tool")
-        self.store.reserve(self.run_id, "tool_calls", 1, self.config)
-        async with self.resources.database:
-            return await _invoke(callback, *args, **kwargs)
+        def authorize():
+            if self.store.is_cancel_requested(self.run_id):
+                raise asyncio.CancelledError
+            self.store.reserve(self.run_id, "tool_calls", 1, self.config)
+
+        return await _invoke_tool(self.resources.database, callback, authorize, *args, **kwargs)
 
     async def idempotent_tool_call(
         self,
@@ -726,6 +663,8 @@ class TaskExecutionContext:
             raise ValueError("operation must be a non-empty string")
         if not isinstance(tool_name, str) or tool_name not in self.task.allowed_tools:
             raise PlanError(f"task {self.task.task_id} attempted a non-whitelisted tool")
+        if self.store.is_cancel_requested(self.run_id):
+            raise asyncio.CancelledError
         operation_key = f"{self.idempotency_key}:{operation.strip()}"
         state, cached = self.store.begin_effect(self.run_id, operation_key)
         if state == "cached":
@@ -734,23 +673,26 @@ class TaskExecutionContext:
             raise ExternalOperationUncertain(
                 f"external operation requires reconciliation before retry: {operation_key}"
             )
-        try:
-            # Reserve inside the effect transaction's guarded section.  A
-            # local budget rejection did not reach the external service and
-            # must not leave the effect looking like an unresolved side
-            # effect after a restart.
+        dispatched = False
+        def authorize():
+            nonlocal dispatched
+            if self.store.is_cancel_requested(self.run_id):
+                raise asyncio.CancelledError
             self.store.reserve(self.run_id, "tool_calls", 1, self.config)
-            async with self.resources.database:
-                value = await _invoke(
-                    callback,
-                    *args,
-                    idempotency_key=operation_key,
-                    **kwargs,
-                )
+            dispatched = True
+
+        try:
+            value = await _invoke_tool(
+                self.resources.database, callback, authorize, *args,
+                idempotency_key=operation_key, **kwargs,
+            )
             self.store.complete_effect(self.run_id, operation_key, value)
             return value
-        except Exception as exc:
-            self.store.fail_effect(self.run_id, operation_key, type(exc).__name__)
+        except BaseException as exc:
+            # Before dispatch nothing reached the provider. After dispatch, even
+            # cancellation/timeout may hide a committed write: keep it uncertain.
+            if not dispatched:
+                self.store.fail_effect(self.run_id, operation_key, type(exc).__name__)
             raise
 
 
@@ -760,7 +702,7 @@ class RunExecutionContext:
 
     run_id: str
     store: SQLiteRunStore
-    config: TaskSchedulerConfig
+    config: CaseExecutionConfig
     resources: SharedResourceLimits
 
     async def llm_call(
@@ -772,192 +714,13 @@ class RunExecutionContext:
     ) -> Any:
         if not isinstance(max_output_tokens, int) or isinstance(max_output_tokens, bool) or max_output_tokens <= 0:
             raise ValueError("max_output_tokens must be a positive integer")
-        self.store.reserve_llm(self.run_id, max_output_tokens, self.config)
+        if self.store.is_cancel_requested(self.run_id):
+            raise asyncio.CancelledError
         async with self.resources.llm:
+            if self.store.is_cancel_requested(self.run_id):
+                raise asyncio.CancelledError
+            self.store.reserve_llm(self.run_id, max_output_tokens, self.config)
             return await _invoke_async(callback, *args, **kwargs)
-
-
-TaskWorker = Callable[[InvestigationTask, dict[str, Any], TaskExecutionContext], Awaitable[Any]]
-
-
-@dataclass(frozen=True)
-class CaseExecutionResult:
-    run_id: str
-    status: str
-    tasks: Mapping[str, Mapping[str, Any]]
-    budget: Mapping[str, int]
-    max_active_tasks: int
-
-    @property
-    def succeeded_count(self) -> int:
-        return sum(item["status"] == "succeeded" for item in self.tasks.values())
-
-    @property
-    def failed_count(self) -> int:
-        return sum(item["status"] == "failed" for item in self.tasks.values())
-
-    @property
-    def blocked_count(self) -> int:
-        return sum(item["status"] == "blocked" for item in self.tasks.values())
-
-
-class CaseTaskScheduler:
-    def __init__(
-        self,
-        store: SQLiteRunStore,
-        worker: TaskWorker,
-        *,
-        config: TaskSchedulerConfig = TaskSchedulerConfig(),
-        resources: SharedResourceLimits | None = None,
-    ) -> None:
-        if not inspect.iscoroutinefunction(worker) and not inspect.iscoroutinefunction(getattr(worker, "__call__", None)):
-            raise TypeError("worker must be an async callable; wrap blocking I/O with TaskExecutionContext.tool_call")
-        self.store = store
-        self.worker = worker
-        self.config = config
-        self.resources = resources or SharedResourceLimits()
-
-    def workflow_context(self, run_id: str) -> RunExecutionContext:
-        return RunExecutionContext(run_id, self.store, self.config, self.resources)
-
-    def prepare_run(self, run_id: str, scope: CaseTaskScope) -> None:
-        self.store.prepare_run(run_id, self.config, scope)
-
-    async def run(
-        self,
-        run_id: str,
-        tasks: Sequence[InvestigationTask],
-        case_facts: Mapping[str, Any],
-        *,
-        scope: CaseTaskScope,
-        finalize: bool = True,
-    ) -> CaseExecutionResult:
-        validate_task_plan(
-            tasks,
-            max_total_tasks=self.config.max_total_tasks,
-            scope=scope,
-        )
-        self.store.start_run(run_id, tasks, self.config, scope)
-        active: dict[asyncio.Task[Any], str] = {}
-        observed_max = 0
-        executing = 0
-        execution_lock = asyncio.Lock()
-
-        async def execute_one(task: InvestigationTask, task_input: dict[str, Any], context: TaskExecutionContext) -> Any:
-            nonlocal executing, observed_max
-            async with execution_lock:
-                executing += 1
-                observed_max = max(observed_max, executing)
-            try:
-                if self.store.is_cancel_requested(context.run_id):
-                    raise asyncio.CancelledError
-                return await self.worker(task, task_input, context)
-            finally:
-                async with execution_lock:
-                    executing -= 1
-
-        try:
-            while True:
-                if self.store.is_cancel_requested(run_id):
-                    raise asyncio.CancelledError
-                records = self.store.load_tasks(run_id)
-                changed = self._block_failed_dependents(run_id, records)
-                if changed:
-                    records = self.store.load_tasks(run_id)
-                slots = self.config.case_task_limit - len(active)
-                ready = [
-                    record["task"]
-                    for _, record in sorted(records.items())
-                    if record["status"] == "pending"
-                    and all(records[dependency]["status"] == "succeeded" for dependency in record["task"].depends_on)
-                ]
-                for task in ready[:max(0, slots)]:
-                    dependency_results = {
-                        dependency: deepcopy(records[dependency]["result"])
-                        for dependency in task.depends_on
-                    }
-                    context = TaskExecutionContext(
-                        run_id=run_id,
-                        task=task,
-                        idempotency_key=records[task.task_id]["idempotency_key"],
-                        store=self.store,
-                        config=self.config,
-                        resources=self.resources,
-                    )
-                    self.store.save_task(run_id, task.task_id, "running", increment_attempt=True)
-                    task_input = {
-                        "task": task.to_dict(),
-                        "case_facts": deepcopy(dict(case_facts)),
-                        "dependency_results": dependency_results,
-                        "task_state": {},
-                    }
-                    active[asyncio.create_task(execute_one(task, task_input, context))] = task.task_id
-                if not active:
-                    break
-                completed, _ = await asyncio.wait(active, return_when=asyncio.FIRST_COMPLETED)
-                for future in completed:
-                    task_id = active.pop(future)
-                    try:
-                        output = future.result()
-                        encoded = _json(output)
-                        self.store.save_task(run_id, task_id, "succeeded", result=json.loads(encoded))
-                    except asyncio.CancelledError:
-                        self.store.save_task(run_id, task_id, "pending")
-                        raise
-                    except Exception as exc:
-                        # Adapter exception text can contain SQL or case-derived values.
-                        self.store.save_task(run_id, task_id, "failed", error=type(exc).__name__)
-            records = self.store.load_tasks(run_id)
-            success = all(record["status"] == "succeeded" for record in records.values())
-            if finalize:
-                self.store.finish_run(run_id, "success" if success else "failed")
-            return CaseExecutionResult(
-                run_id=run_id,
-                status="success" if success else "failed",
-                tasks=records,
-                budget=self.store.budget_usage(run_id),
-                max_active_tasks=observed_max,
-            )
-        except asyncio.CancelledError:
-            for future, task_id in list(active.items()):
-                future.cancel()
-                self.store.save_task(run_id, task_id, "pending")
-            if active:
-                await asyncio.gather(*active, return_exceptions=True)
-            if finalize:
-                self.store.finish_run(run_id, "cancelled")
-            raise
-        except Exception:
-            if finalize:
-                self.store.finish_run(run_id, "failed")
-            raise
-
-    def append_recheck_tasks(
-        self,
-        run_id: str,
-        tasks: Sequence[InvestigationTask],
-        *,
-        scope: CaseTaskScope,
-    ) -> None:
-        records = self.store.load_tasks(run_id)
-        all_tasks = [record["task"] for record in records.values()] + list(tasks)
-        validate_task_plan(
-            all_tasks,
-            max_total_tasks=self.config.max_total_tasks,
-            scope=scope,
-        )
-        self.store.add_tasks(run_id, tasks, self.config.max_total_tasks, scope)
-
-    def _block_failed_dependents(self, run_id: str, records: Mapping[str, Mapping[str, Any]]) -> bool:
-        changed = False
-        for task_id, record in records.items():
-            if record["status"] != "pending":
-                continue
-            dependency_states = [records[dependency]["status"] for dependency in record["task"].depends_on]
-            if any(status in {"failed", "blocked"} for status in dependency_states):
-                self.store.save_task(run_id, task_id, "blocked", error="a prerequisite task did not complete")
-                changed = True
-        return changed
 
 
 def validate_task_plan(
@@ -1049,10 +812,33 @@ async def _invoke_async(callback: Callable[..., Awaitable[Any]], *args: Any, **k
     return await result
 
 
-async def _invoke(callback: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
-    if inspect.iscoroutinefunction(callback):
-        return await callback(*args, **kwargs)
-    return await asyncio.to_thread(callback, *args, **kwargs)
+async def _invoke_tool(gate, callback, authorize, *args, **kwargs):
+    """Hold the resource permit until blocking I/O actually finishes.
+
+    Cancelling an await cannot kill a thread. Releasing early would let a
+    native retry exceed the database cap while the old query is still running.
+    """
+    await gate.acquire()
+    release_here = True
+    try:
+        authorize()
+        if inspect.iscoroutinefunction(callback) or inspect.iscoroutinefunction(getattr(callback, "__call__", None)):
+            return await callback(*args, **kwargs)
+        future = asyncio.get_running_loop().run_in_executor(None, partial(callback, *args, **kwargs))
+        try:
+            return await asyncio.shield(future)
+        except asyncio.CancelledError:
+            release_here = False
+            def finished(completed):
+                try:
+                    completed.exception()
+                finally:
+                    gate.release()
+            future.add_done_callback(finished)
+            raise
+    finally:
+        if release_here:
+            gate.release()
 
 
 def _json(value: Any) -> str:
