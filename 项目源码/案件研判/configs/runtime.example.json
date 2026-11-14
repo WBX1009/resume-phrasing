@@ -1,0 +1,14 @@
+{
+  "case_task_limit": 2,
+  "max_total_tasks": 100,
+  "max_llm_calls": 200,
+  "max_tool_calls": 200,
+  "max_reserved_tokens": 2000000,
+  "candidate_limit": 100,
+  "max_attempts": 3,
+  "task_timeout": 120,
+  "max_worker_steps": 6,
+  "max_recheck_rounds": 2,
+  "max_context_facts": 100,
+  "max_context_chars": 32000
+}

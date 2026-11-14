@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import Counter
+from contextlib import contextmanager
 from dataclasses import dataclass
 import json
 from pathlib import Path
@@ -46,6 +47,7 @@ def _placeholders(values: list[int]) -> str:
     return ", ".join(["%s"] * len(values))
 
 
+@contextmanager
 def _connect(config: AppConfig):
     if psycopg2 is None:
         raise RuntimeError("psycopg2 is not installed")
@@ -61,9 +63,12 @@ def _connect(config: AppConfig):
         sslmode=db.ssl_mode,
         connect_timeout=5,
     )
-    conn.set_client_encoding("UTF8")
-    conn.set_session(readonly=True, autocommit=True)
-    return conn
+    try:
+        conn.set_client_encoding("UTF8")
+        conn.set_session(readonly=True, autocommit=True)
+        yield conn
+    finally:
+        conn.close()
 
 
 def _load_from_db(config: AppConfig, case_id: int, model_ids: list[int]) -> LoadedData:

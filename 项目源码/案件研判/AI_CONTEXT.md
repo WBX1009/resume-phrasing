@@ -1,71 +1,21 @@
-# AI_CONTEXT
+# 项目源码阅读入口
 
-## 项目定位
+唯一端到端入口为 src.case_api:app 或 src.case_cli，两者共享 CaseRunService 与 case_workflow_graph。先读 README 和 docs/execution/native_task_runtime.md，再定位对应模块。
 
-这是一个“证据优先”的模型结果研判 Agent 学习项目。输入不是原始业务库，而是经过授权、脱敏后的模型结果快照；系统先用确定性算子生成 FactPack，再让受控 Agent 在白名单工具和预算约束内补证，最后生成带引用的报告。
+| 职责 | 实现 |
+| --- | --- |
+| 服务端授权输入、准入快照 | case_repository.py、case_run_service.py |
+| 事实准备、规则召回、引用校验、集中核验 | investigation_domain.py；复用 case_fact_pack / entity_profile / anomaly_rules |
+| 语义召回、TaskPlan、Worker 决策 | investigation_reasoner.py；在线异步模型，离线明确降级 |
+| 案件主图与双通道合流 | case_workflow_graph.py |
+| 业务依赖判断、Send、结果 reducer | case_task_graph.py |
+| Planner → Tool → Judge 条件循环 | case_worker_subgraph.py；原生 @task 重试/超时/恢复 |
+| 参数授权、工具调用、幂等边界 | investigation_tools.py；复用 supplement_tools 与 model_tools |
+| 预算、不可变事实存储、查询投影 | case_execution.py |
+| 独立缺口与定向补证 | directed_supplement.py |
+| 同一报告的多格式投影 | case_report.py |
+| 质量与性能评测协议 | event_evaluation / evaluation_protocol / performance_evaluation / langsmith_event_evaluation |
 
-## 关键设计原则
+业务 Task 不是 LangGraph PregelTask，也没有自定义 TaskRun 执行器。业务实体、权限、预算、失败阻断、外部幂等是应用策略；可重建任务投影只用于查询。恢复权威仅为原生 checkpoint 与准入快照，不能从投影行重新调度。
 
-1. **事实与推理分离**：数字、统计、排序、时间范围和关系指标由 Python 代码计算，LLM 不负责事实计算。
-2. **受控 Agent**：Planner 只能选择注册过的工具，执行器校验参数、模型调用边、重复调用和预算。
-3. **追加式证据链**：基础事实不可覆盖；工具结果以 SupplementFact 追加；每条 Claim 必须引用已存在的 Fact/Model。
-4. **保守降级**：无数据、字段不完整、工具失败或证据不足时，输出 `unsupported` / `unresolved` / `downgraded`，不猜结论。
-5. **可回放**：报告、trace、manifest、checkpoint 和 fingerprint 服务于恢复、篡改检测和重复运行校验。
-6. **离线优先**：默认运行不调用在线模型；在线 LLM 必须显式配置，并且不能越过事实和预算边界。
-
-## 代码阅读地图
-
-- `src/quality_registry.py`：模型目录、字段契约、策略族和跨模型依赖。
-- `src/quality_operators.py`：确定性事实算子。
-- `src/quality_reasoning.py`：策略路由、工具调用和 Claim 构建。
-- `src/agent_loop.py`：模型类级 Planner → Tool → Judge 循环。
-- `src/supplement_tools.py`：补证工具及参数约束。
-- `src/candidate_events.py`：把确定性异常标记和结构化模型线索整理为可追溯的候选风险疑点。
-- `src/directed_supplement.py`：把核验缺口转换为范围受限的补证任务。
-- `src/evaluation_protocol.py`：冻结 baseline、完整策略和 ablation 的评测控制条件。
-- `src/evidence_chain.py`：证据步骤、引用和状态转移。
-- `src/final_agent_report.py` / `src/report_writer.py`：最终报告和多格式投影。
-- `src/quality_engine.py`：质量流水线、checkpoint、resume、replay 和输出物管理。
-- `src/config.py` / `src/data_loader.py`：环境配置与数据源适配；不要在其中写入凭据。
-
-## 端到端数据流
-
-```text
-Snapshot
-  → Registry / Schema validation
-  → Deterministic Facts
-  → Policy selection
-  → Whitelisted ToolRequest
-  → Supplement Facts
-  → Evidence Chain
-  → Claim validation
-  → report.json → report.md / replay artifacts
-```
-
-## 后续指导约束
-
-当 ChatGPT 修改这个项目时，优先遵循以下顺序：
-
-1. 先定位现有输入、输出和失败关闭路径，再提出改动。
-2. 不把真实数据、内网地址、账号、密码、API Key 或个人信息写入代码、测试、日志和文档。
-3. 不把抽样快照的结果写成生产精度、召回率或业务收益。
-4. 任何新工具都必须有白名单注册、参数 schema、预算/重复调用控制、结构化 Observation 和测试。
-5. 任何新 Claim 都必须能回指 Fact/Model，并覆盖无数据、坏数据、工具失败和恢复场景。
-6. 先补最小离线测试，再考虑在线模型或数据库适配。
-
-## 公开版已知限制
-
-公开版没有携带原项目的真实快照，因此依赖私有快照的全量质量测试不能直接运行。应使用新的合成或经授权脱敏 fixture 重新建立测试基线，而不是复制原始业务数据。
-
-公开版候选风险疑点生成只接受确定性 FactPack 和结构化 model clues；它不会从自由文本推断真实风险事件。事件匹配策略、真实风险规则、基线流程、补证案例、专家标注和简历中的生产指标仍需由授权材料确认。
-默认公开服务还接受任务 payload 中的结构化 `verification.gaps` 作为合成核验边界，
-用来演示缺口转补证任务和再次核验；这不代表公开版包含生产 Verifier 或真实补证结果。
-
-
-## 案件任务执行入口
-
-- `src/case_task_graph.py`：业务就绪判断、Send、按 Task ID 合并终态结果；不读取任务查询表决定执行。
-- `src/case_worker_subgraph.py`：调用级隔离、原生 RetryPolicy / timeout / error_handler；运行上下文通过 Runtime 注入。
-- `src/case_execution.py`：任务与范围契约、原子预算、外部幂等操作及可重建查询投影。
-- `src/case_run_service.py`：单事件循环承载案件；启动恢复 native-v2 未完成案件、取消、报告发布与 SSE。
-- 恢复与部署边界统一见 `docs/execution/native_task_runtime.md`。案件任务只有原生图执行入口。
+本目录已移除旧手写 Agent / QualityEngine 编排与手写模型重试。底层无副作用业务算子可以作为库使用，不能再引入第二套执行/恢复入口。新增行为按上述契约融入节点、条件边、Send 或原生 @task，并覆盖实际业务边界的端到端测试。数据和效果边界见 README。

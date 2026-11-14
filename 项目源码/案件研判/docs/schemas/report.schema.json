@@ -1,70 +1,376 @@
 {
-  "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://model-insight-agent.local/schema/report-1.0.json",
-  "title": "Model Insight Agent Report",
-  "type": "object",
-  "required": ["schema_version", "manifest", "coverage", "models", "facts", "claims", "validation"],
-  "properties": {
-    "schema_version": {"const": "1.0"},
-    "manifest": {
-      "type": "object",
-      "required": ["run_id", "snapshot_sha256", "profile_count", "sampled_profile_count", "unsupported_profile_count", "online", "status"],
+  "$defs": {
+    "Candidate": {
+      "additionalProperties": false,
       "properties": {
-        "run_id": {"type": "string", "minLength": 1},
-        "snapshot_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
-        "profile_count": {"type": "integer", "minimum": 0},
-        "sampled_profile_count": {"type": "integer", "minimum": 0},
-        "unsupported_profile_count": {"type": "integer", "minimum": 0},
-        "online": {"type": "boolean"},
-        "status": {"enum": ["running", "success", "failed"]}
-      }
+        "event_type": {
+          "maxLength": 120,
+          "minLength": 1,
+          "title": "Event Type",
+          "type": "string"
+        },
+        "subject_ids": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 30,
+          "minItems": 1,
+          "title": "Subject Ids",
+          "type": "array"
+        },
+        "fact_ids": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 100,
+          "minItems": 1,
+          "title": "Fact Ids",
+          "type": "array"
+        },
+        "time_range": {
+          "anyOf": [
+            {
+              "maxItems": 2,
+              "minItems": 2,
+              "prefixItems": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "string"
+                }
+              ],
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Time Range"
+        },
+        "rationale": {
+          "maxLength": 2000,
+          "minLength": 1,
+          "title": "Rationale",
+          "type": "string"
+        },
+        "priority": {
+          "default": 0,
+          "maximum": 10,
+          "minimum": 0,
+          "title": "Priority",
+          "type": "integer"
+        },
+        "event_id": {
+          "default": "",
+          "title": "Event Id",
+          "type": "string"
+        },
+        "source": {
+          "items": {
+            "enum": [
+              "rule",
+              "llm"
+            ],
+            "type": "string"
+          },
+          "title": "Source",
+          "type": "array"
+        },
+        "status": {
+          "const": "candidate",
+          "default": "candidate",
+          "title": "Status",
+          "type": "string"
+        }
+      },
+      "required": [
+        "event_type",
+        "subject_ids",
+        "fact_ids",
+        "rationale"
+      ],
+      "title": "Candidate",
+      "type": "object"
+    },
+    "InvestigationGoal": {
+      "additionalProperties": false,
+      "properties": {
+        "goal_id": {
+          "minLength": 1,
+          "title": "Goal Id",
+          "type": "string"
+        },
+        "candidate_id": {
+          "minLength": 1,
+          "title": "Candidate Id",
+          "type": "string"
+        },
+        "requirements": {
+          "items": {
+            "$ref": "#/$defs/Requirement"
+          },
+          "maxItems": 10,
+          "minItems": 1,
+          "title": "Requirements",
+          "type": "array"
+        }
+      },
+      "required": [
+        "goal_id",
+        "candidate_id",
+        "requirements"
+      ],
+      "title": "InvestigationGoal",
+      "type": "object"
+    },
+    "Requirement": {
+      "additionalProperties": false,
+      "properties": {
+        "requirement_id": {
+          "maxLength": 120,
+          "minLength": 1,
+          "title": "Requirement Id",
+          "type": "string"
+        },
+        "question": {
+          "maxLength": 2000,
+          "minLength": 1,
+          "title": "Question",
+          "type": "string"
+        }
+      },
+      "required": [
+        "requirement_id",
+        "question"
+      ],
+      "title": "Requirement",
+      "type": "object"
+    },
+    "TaskSpec": {
+      "additionalProperties": false,
+      "properties": {
+        "task_id": {
+          "minLength": 1,
+          "title": "Task Id",
+          "type": "string"
+        },
+        "question": {
+          "maxLength": 2000,
+          "minLength": 1,
+          "title": "Question",
+          "type": "string"
+        },
+        "candidate_id": {
+          "title": "Candidate Id",
+          "type": "string"
+        },
+        "goal_id": {
+          "title": "Goal Id",
+          "type": "string"
+        },
+        "entity_ids": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 30,
+          "minItems": 1,
+          "title": "Entity Ids",
+          "type": "array"
+        },
+        "time_range": {
+          "maxItems": 2,
+          "minItems": 2,
+          "prefixItems": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "string"
+            }
+          ],
+          "title": "Time Range",
+          "type": "array"
+        },
+        "basis_fact_ids": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 100,
+          "minItems": 1,
+          "title": "Basis Fact Ids",
+          "type": "array"
+        },
+        "allowed_tools": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 30,
+          "title": "Allowed Tools",
+          "type": "array"
+        },
+        "depends_on": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 100,
+          "title": "Depends On",
+          "type": "array"
+        },
+        "gap_ids": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 10,
+          "title": "Gap Ids",
+          "type": "array"
+        },
+        "source_task_ids": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 100,
+          "title": "Source Task Ids",
+          "type": "array"
+        },
+        "payload": {
+          "additionalProperties": true,
+          "title": "Payload",
+          "type": "object"
+        }
+      },
+      "required": [
+        "task_id",
+        "question",
+        "candidate_id",
+        "goal_id",
+        "entity_ids",
+        "time_range",
+        "basis_fact_ids",
+        "allowed_tools"
+      ],
+      "title": "TaskSpec",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "case_id": {
+      "title": "Case Id",
+      "type": "string"
+    },
+    "run_id": {
+      "title": "Run Id",
+      "type": "string"
+    },
+    "status": {
+      "enum": [
+        "success",
+        "partial"
+      ],
+      "title": "Status",
+      "type": "string"
+    },
+    "data_label": {
+      "title": "Data Label",
+      "type": "string"
+    },
+    "runtime": {
+      "const": "langgraph-native-v3",
+      "title": "Runtime",
+      "type": "string"
+    },
+    "snapshot_ref": {
+      "title": "Snapshot Ref",
+      "type": "string"
+    },
+    "candidate_events": {
+      "items": {
+        "$ref": "#/$defs/Candidate"
+      },
+      "title": "Candidate Events",
+      "type": "array"
+    },
+    "goals": {
+      "items": {
+        "$ref": "#/$defs/InvestigationGoal"
+      },
+      "title": "Goals",
+      "type": "array"
+    },
+    "tasks": {
+      "items": {
+        "$ref": "#/$defs/TaskSpec"
+      },
+      "title": "Tasks",
+      "type": "array"
+    },
+    "task_outcomes": {
+      "additionalProperties": {
+        "additionalProperties": true,
+        "type": "object"
+      },
+      "title": "Task Outcomes",
+      "type": "object"
+    },
+    "verification": {
+      "additionalProperties": true,
+      "title": "Verification",
+      "type": "object"
+    },
+    "fact_ids": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Fact Ids",
+      "type": "array"
+    },
+    "discovery": {
+      "additionalProperties": true,
+      "title": "Discovery",
+      "type": "object"
     },
     "coverage": {
-      "type": "object",
-      "required": ["total_models", "sampled_models", "unsupported_no_sample", "valid"]
+      "additionalProperties": true,
+      "title": "Coverage",
+      "type": "object"
     },
-    "models": {"type": "array", "items": {"$ref": "#/$defs/model"}},
-    "facts": {"type": "array", "items": {"$ref": "#/$defs/fact"}},
-    "claims": {"type": "array", "items": {"$ref": "#/$defs/claim"}},
-    "validation": {"type": "object", "required": ["claims", "registry"]}
-  },
-  "$defs": {
-    "model": {
-      "type": "object",
-      "required": ["model_id", "name", "strategy_key", "coverage", "reasoning_mode", "status"],
-      "properties": {
-        "model_id": {"type": "integer"},
-        "name": {"type": "string"},
-        "strategy_key": {"type": "string", "minLength": 1},
-        "coverage": {"enum": ["sampled", "unsupported_no_sample"]},
-        "reasoning_mode": {"enum": ["deterministic", "react", "plan_solve", "plan_react_reflect"]},
-        "status": {"type": "string"}
-      }
+    "recheck_rounds": {
+      "title": "Recheck Rounds",
+      "type": "integer"
     },
-    "fact": {
-      "type": "object",
-      "required": ["fact_id", "model_id", "case_id", "kind", "subject", "value", "complete"],
-      "properties": {
-        "fact_id": {"type": "string", "minLength": 1},
-        "model_id": {"type": "integer"},
-        "case_id": {},
-        "kind": {"type": "string"},
-        "subject": {"type": "string"},
-        "value": {},
-        "complete": {"type": "boolean"}
-      }
+    "budget": {
+      "additionalProperties": {
+        "type": "integer"
+      },
+      "title": "Budget",
+      "type": "object"
     },
-    "claim": {
-      "type": "object",
-      "required": ["claim_id", "level", "text", "model_ids", "fact_ids", "status"],
-      "properties": {
-        "claim_id": {"type": "string", "minLength": 1},
-        "level": {"enum": ["fact", "rule_hit", "inference", "unresolved"]},
-        "text": {"type": "string"},
-        "model_ids": {"type": "array", "items": {"type": "integer"}},
-        "fact_ids": {"type": "array", "items": {"type": "string"}},
-        "status": {"enum": ["accepted", "downgraded", "rejected"]}
-      }
+    "evidence_boundary": {
+      "title": "Evidence Boundary",
+      "type": "string"
     }
-  }
+  },
+  "required": [
+    "case_id",
+    "run_id",
+    "status",
+    "data_label",
+    "runtime",
+    "snapshot_ref",
+    "candidate_events",
+    "goals",
+    "tasks",
+    "task_outcomes",
+    "verification",
+    "fact_ids",
+    "discovery",
+    "coverage",
+    "recheck_rounds",
+    "budget",
+    "evidence_boundary"
+  ],
+  "title": "CaseReport",
+  "type": "object"
 }

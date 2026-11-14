@@ -1,247 +1,127 @@
-"""FastAPI boundary for asynchronous case runs.
-
-The default app is deliberately deterministic and data-free for this public
-repository.  Production callers can inject the same service with their
-authorized planner, database adapters, verifier, and report builder.
-"""
-
+"""FastAPI entry using the same service as the CLI. Import creates no runtime."""
 from __future__ import annotations
 
-from pathlib import Path
-from contextlib import asynccontextmanager
 import asyncio
-from typing import Any
-from uuid import uuid4
+from contextlib import asynccontextmanager
+import json
+import os
+from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, status
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field
+from fastapi import Response
+from typing import Literal
+from pydantic import Field
 
+from .case_execution import SQLiteRunStore, CaseExecutionConfig
+from .case_repository import FileCaseRepository
 from .case_run_service import CaseRunService
-from .candidate_events import CandidateEventBuilder
-from .case_execution import (
-    InvestigationTask,
-    SQLiteRunStore,
-    TaskExecutionContext,
-    CaseExecutionConfig,
-)
-from .directed_supplement import build_recheck_tasks, has_actionable_gaps
+from .investigation_contracts import Contract
+from .investigation_reasoner import OfflineReasoner, OpenAIReasoner
 
 
-class CaseScopeRequest(BaseModel):
-    entity_ids: list[str] = Field(min_length=1)
-    fact_ids: list[str] = Field(default_factory=list)
-    allowed_tools: list[str] = Field(default_factory=list)
-    time_range: list[str] | None = None
+class CaseRunRequest(Contract):
+    case_id: str = Field(pattern=r"^[A-Za-z0-9_-]{1,100}$")
+    run_id: str | None = Field(default=None, pattern=r"^[A-Za-z0-9_-]{1,100}$")
 
 
-class CaseRunRequest(BaseModel):
-    case_id: str = Field(min_length=1)
-    run_id: str | None = None
-    case_facts: dict[str, Any] = Field(default_factory=dict)
-    case_scope: CaseScopeRequest
-    tasks: list[dict[str, Any]] = Field(default_factory=list)
+def build_service(*, repository_root=None, storage_root=None, offline=False, config=None):
+    repository_root = repository_root or os.environ.get("CASE_REPOSITORY")
+    if repository_root is None:
+        raise ValueError("configure an administrator-approved CASE_REPOSITORY directory")
+    root = Path(storage_root or os.environ.get("CASE_RUNTIME_DIR", "runtime/native-v3")).resolve()
+    if config is None:
+        config_path = os.environ.get("CASE_EXECUTION_CONFIG")
+        config = CaseExecutionConfig(**json.loads(Path(config_path).read_text(encoding="utf-8"))) if config_path else CaseExecutionConfig()
+    if offline or os.environ.get("CASE_REASONER") == "offline":
+        reasoner = OfflineReasoner()
+    else:
+        model = os.environ.get("CASE_LLM_MODEL")
+        api_key = os.environ.get("CASE_LLM_API_KEY")
+        if not model or not api_key:
+            raise ValueError("configure CASE_LLM_MODEL/CASE_LLM_API_KEY, or explicitly select offline mode")
+        reasoner = OpenAIReasoner(model=model, api_key=api_key, base_url=os.environ.get("CASE_LLM_BASE_URL"))
+    return CaseRunService(SQLiteRunStore(root / "runs.sqlite3"), repository=FileCaseRepository(repository_root),
+        reasoner=reasoner, config=config)
 
 
-def create_app(service: CaseRunService | None = None) -> FastAPI:
-    active_service = service or _build_default_service()
-
+def create_app(service_factory=None):
     @asynccontextmanager
     async def lifespan(app):
-        yield
-        await asyncio.to_thread(active_service.close)
+        app.state.case_run_service = await asyncio.to_thread(service_factory or build_service)
+        try:
+            yield
+        finally:
+            await asyncio.to_thread(app.state.case_run_service.close)
 
-    app = FastAPI(title="Model Insight Agent Case Runs", version="0.1.0", lifespan=lifespan)
+    app = FastAPI(title="Evidence-first case investigation", version="0.3.0", lifespan=lifespan)
+
+    def service(request: Request):
+        return request.app.state.case_run_service
 
     @app.get("/health")
-    async def health() -> dict[str, str]:
+    async def health():
         return {"status": "ok"}
 
-    @app.post("/v1/case-runs", status_code=status.HTTP_202_ACCEPTED)
-    async def submit_case(request: CaseRunRequest) -> dict[str, Any]:
-        run_id = request.run_id or uuid4().hex
+    @app.post("/v1/case-runs", status_code=202)
+    async def submit(body: CaseRunRequest, request: Request):
         try:
-            payload = request.model_dump()
-            payload["run_id"] = run_id
-            payload["case_scope"] = request.case_scope.model_dump()
-            payload["initial_tasks"] = payload.pop("tasks", [])
-            return active_service.submit(payload)
-        except (ValueError, KeyError) as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
+            return await asyncio.to_thread(service(request).submit, body.case_id, run_id=body.run_id)
+        except (KeyError, FileNotFoundError) as exc:
+            raise HTTPException(404, "case not available") from exc
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
 
     @app.get("/v1/case-runs/{run_id}")
-    async def get_case_status(run_id: str) -> dict[str, Any]:
-        record = active_service.status(run_id)
+    async def status(run_id: str, request: Request):
+        record = await asyncio.to_thread(service(request).status, run_id)
         if record is None:
-            raise HTTPException(status_code=404, detail="unknown run_id")
+            raise HTTPException(404, "unknown run_id")
         return record
 
     @app.post("/v1/case-runs/{run_id}/cancel")
-    async def cancel_case(run_id: str) -> dict[str, Any]:
+    async def cancel(run_id: str, request: Request):
         try:
-            accepted = active_service.cancel(run_id)
+            return {"run_id": run_id, "cancel_requested": await asyncio.to_thread(service(request).cancel, run_id)}
         except KeyError as exc:
-            raise HTTPException(status_code=404, detail="unknown run_id") from exc
-        record = active_service.status(run_id)
-        return {"run_id": run_id, "cancel_requested": accepted, "status": record["status"]}
+            raise HTTPException(404, "unknown run_id") from exc
 
     @app.post("/v1/case-runs/{run_id}/resume", status_code=202)
-    async def resume_case(run_id: str):
+    async def resume(run_id: str, request: Request):
         try:
-            return active_service.resume(run_id)
+            return await asyncio.to_thread(service(request).resume, run_id)
         except ValueError as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
+            raise HTTPException(409, str(exc)) from exc
 
     @app.get("/v1/case-runs/{run_id}/report")
-    async def get_case_report(run_id: str) -> dict[str, Any]:
-        record = active_service.status(run_id)
-        if record is None:
-            raise HTTPException(status_code=404, detail="unknown run_id")
-        report = active_service.report(run_id)
-        if record["status"] != "success" or report is None:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail={"status": record["status"], "error": record["error"]},
-            )
-        return report
+    async def report(run_id: str, request: Request, format: Literal["json", "md", "html", "docx"] = "json"):
+        try:
+            result = await asyncio.to_thread(service(request).report, run_id)
+        except KeyError as exc:
+            raise HTTPException(404, "unknown run_id") from exc
+        if result is None:
+            raise HTTPException(409, "report is not available yet")
+        if format == "json":
+            return result
+        from .case_report import render_report
+        content, media_type = await asyncio.to_thread(render_report, result, format)
+        return Response(content, media_type=media_type)
+
+    @app.get("/v1/case-runs/{run_id}/facts/{fact_id}")
+    async def fact(run_id: str, fact_id: str, request: Request):
+        try:
+            return await asyncio.to_thread(service(request).fact, run_id, fact_id)
+        except (KeyError, ValueError) as exc:
+            raise HTTPException(404, "unknown published fact") from exc
 
     @app.get("/v1/case-runs/{run_id}/events")
-    async def case_events(run_id: str) -> StreamingResponse:
-        if active_service.status(run_id) is None:
-            raise HTTPException(status_code=404, detail="unknown run_id")
-        return StreamingResponse(
-            active_service.iter_sse_events(run_id),
-            media_type="text/event-stream",
-            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
-        )
+    async def events(run_id: str, request: Request):
+        if await asyncio.to_thread(service(request).status, run_id) is None:
+            raise HTTPException(404, "unknown run_id")
+        return StreamingResponse(service(request).iter_sse_events(run_id), media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
-    app.state.case_run_service = active_service
     return app
-
-
-def _build_default_service(storage_root: Path | str | None = None) -> CaseRunService:
-    root = Path(storage_root).resolve() if storage_root is not None else Path(__file__).resolve().parent.parent
-    store = SQLiteRunStore(root / "runtime" / "case_runtime.sqlite3")
-    config = CaseExecutionConfig()
-    candidate_builder = CandidateEventBuilder(max_events=config.candidate_limit)
-
-    async def worker(task: InvestigationTask, task_input: dict[str, Any], context: TaskExecutionContext) -> dict[str, Any]:
-        # This public snapshot returns explicitly supplied facts only. The
-        # injected production worker is where GaussDB/tool/LLM calls belong.
-        result = {
-            "task_id": task.task_id,
-            "question": task.question,
-            "evidence": task.payload.get("result", task_input["case_facts"]),
-            "idempotency_key": context.idempotency_key,
-        }
-        # Explicit candidates remain a supported injection boundary. When a
-        # public fact pack is supplied, deterministic rule flags and structured
-        # model clues can build candidates without interpreting free-form text.
-        if "candidate_events" in task.payload:
-            result["candidate_events"] = task.payload["candidate_events"]
-        elif "candidate_event" in task.payload:
-            result["candidate_event"] = task.payload["candidate_event"]
-        elif task.payload.get("source") != "verification_gap":
-            case_facts = task_input.get("case_facts") or {}
-            fact_pack = task.payload.get("fact_pack") or case_facts.get("fact_pack")
-            if isinstance(case_facts, dict) and ("anomaly_flags" in case_facts or "focus_entities" in case_facts):
-                fact_pack = fact_pack or case_facts
-            model_clues = task.payload.get("model_clues") or case_facts.get("model_clues", [])
-            if isinstance(fact_pack, dict):
-                result["candidate_events"] = candidate_builder.build(
-                    fact_pack,
-                    model_clues=model_clues if isinstance(model_clues, list) else [],
-                )
-        # Structured verification output is an explicit seam for the public
-        # synthetic fixture.  It keeps the default service runnable without
-        # pretending to contain a production verifier or model.
-        verification = task.payload.get("verification")
-        if isinstance(verification, dict):
-            for key in ("gaps", "verified_events", "final_events", "human_review"):
-                if key in verification:
-                    result[key] = verification[key]
-        return result
-
-    async def planner(state, context):
-        return [InvestigationTask.from_dict(item) for item in state.get("initial_tasks", [])]
-
-    async def verifier(state, context):
-        gaps: list[dict[str, Any]] = []
-        verified_events: list[dict[str, Any]] = []
-        task_outcomes = state.get("task_outcomes", {})
-        resolved_gap_keys: set[str] = set()
-        for task_id, record in task_outcomes.items():
-            task = record.get("task") if isinstance(record, dict) else None
-            payload = task.get("payload") if isinstance(task, dict) else None
-            if record.get("status") == "succeeded" and isinstance(payload, dict):
-                if payload.get("source") == "verification_gap":
-                    resolved_gap_keys.add(_gap_key(payload.get("gap"), task_id))
-        for task_id, record in task_outcomes.items():
-            if record.get("status") != "succeeded":
-                gaps.append({"task_id": task_id, "reason": "task execution failed"})
-                continue
-            result = record.get("result")
-            if not isinstance(result, dict):
-                continue
-            task_payload = (record.get("task") or {}).get("payload") or {}
-            is_recheck = task_payload.get("source") == "verification_gap"
-            for gap in result.get("gaps", []) or []:
-                if isinstance(gap, dict):
-                    normalized_gap = {**gap, "task_id": gap.get("task_id", task_id)}
-                    if not is_recheck and _gap_key(normalized_gap, task_id) in resolved_gap_keys:
-                        continue
-                    gaps.append(normalized_gap)
-            for event in result.get("verified_events", []) or []:
-                if isinstance(event, dict):
-                    verified_events.append(event)
-        final_events = verified_events if not gaps and verified_events else ([] if gaps else list(state.get("candidate_events", [])))
-        return {
-            "gaps": gaps,
-            "accepted_events": final_events,
-            "final_events": final_events,
-            "human_review": gaps,
-        }
-
-    async def recheck_planner(state, context):
-        return build_recheck_tasks(state)
-
-    async def recheck_allowed(state):
-        return has_actionable_gaps(state)
-
-    async def summarizer(state, context):
-        return {
-            "case_id": state["case_id"],
-            "run_id": state["run_id"],
-            "task_outcomes": state.get("task_outcomes", {}),
-            "verification": state.get("verification", {}),
-            "candidate_events": state.get("candidate_events", []),
-            "final_events": state.get("final_events", []),
-            "human_review": state.get("human_review", []),
-            "limits": {"candidate_limit": context.config.candidate_limit},
-            "evidence_status": "public_snapshot_synthetic_input",
-        }
-
-    return CaseRunService(
-        store,
-        worker=worker,
-        planner=planner,
-        verifier=verifier,
-        recheck_planner=recheck_planner,
-        recheck_allowed=recheck_allowed,
-        summarizer=summarizer,
-        config=config,
-    )
-
-
-def _gap_key(value: Any, fallback_task_id: str) -> str:
-    """Return a stable key so a successful recheck can close its old gap."""
-
-    if isinstance(value, dict):
-        for key in ("candidate_event_id", "task_id"):
-            item = value.get(key)
-            if item:
-                return str(item)
-    return str(fallback_task_id)
 
 
 app = create_app()

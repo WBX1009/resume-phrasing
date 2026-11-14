@@ -15,8 +15,8 @@
 
 | 项目与主题 | 主要路径 |
 | --- | --- |
-| 案件研判：参数化查询、事实与疑点 | `案件研判/src/row_source.py`、`anomaly_rules.py`、`candidate_events.py` |
-| 案件研判：核验与定向补证 | `案件研判/src/case_workflow_graph.py`、`directed_supplement.py`；默认公开服务在 `case_api.py` |
+| 案件研判：参数化查询、事实与疑点 | `案件研判/src/case_repository.py`、`investigation_domain.py`、`row_source.py`、`candidate_events.py` |
+| 案件研判：核验与定向补证 | `案件研判/src/case_workflow_graph.py`、`investigation_tools.py`、`directed_supplement.py`；API 与 CLI 共享同一案件图 |
 | 案件研判：任务调度、状态与恢复 | `案件研判/src/case_task_graph.py`、`case_worker_subgraph.py`、`case_execution.py`、`case_run_service.py` |
 | 案件研判：事件与性能评测 | `案件研判/src/event_evaluation.py`、`evaluation_protocol.py`、`langsmith_event_evaluation.py`、`performance_evaluation.py` |
 | DeepAssist：架构、规划与执行 | `DeepAssist/backend/domain/interfaces/`、`backend/application/agent_app.py`、`backend/infrastructure/agent_runtime/` |

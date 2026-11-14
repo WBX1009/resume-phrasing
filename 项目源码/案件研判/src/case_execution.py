@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable, Mapping, Sequence
+from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
@@ -40,12 +41,11 @@ class CaseTaskScope:
     """Authoritative per-case bounds used to validate every planned task."""
 
     entity_ids: frozenset[str]
-    fact_ids: frozenset[str]
     allowed_tools: frozenset[str]
     time_range: tuple[str, str] | None = None
 
     def __post_init__(self) -> None:
-        for name in ("entity_ids", "fact_ids", "allowed_tools"):
+        for name in ("entity_ids", "allowed_tools"):
             if isinstance(getattr(self, name), (str, bytes)):
                 raise PlanError(f"scope {name} must be a collection of identifiers, not a string")
             values = frozenset(getattr(self, name))
@@ -67,7 +67,6 @@ class CaseTaskScope:
     def to_dict(self) -> dict[str, Any]:
         return {
             "entity_ids": sorted(self.entity_ids),
-            "fact_ids": sorted(self.fact_ids),
             "allowed_tools": sorted(self.allowed_tools),
             "time_range": list(self.time_range) if self.time_range is not None else None,
         }
@@ -83,9 +82,15 @@ class InvestigationTask:
     allowed_tools: tuple[str, ...] = ()
     depends_on: tuple[str, ...] = ()
     payload: Mapping[str, Any] = field(default_factory=dict)
+    candidate_id: str = ""
+    goal_id: str = ""
+    gap_ids: tuple[str, ...] = ()
+    source_task_ids: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
-        for name in ("entity_ids", "basis_fact_ids", "allowed_tools", "depends_on"):
+        for name in ("entity_ids", "basis_fact_ids", "allowed_tools", "depends_on", "gap_ids", "source_task_ids"):
+            if isinstance(getattr(self, name), (str, bytes)):
+                raise PlanError(f"{name} must be a collection")
             values = tuple(getattr(self, name))
             if any(not isinstance(value, str) or not value.strip() for value in values):
                 raise PlanError(f"{name} must contain non-empty strings")
@@ -123,6 +128,10 @@ class InvestigationTask:
             "allowed_tools": list(self.allowed_tools),
             "depends_on": list(self.depends_on),
             "payload": dict(self.payload),
+            "candidate_id": self.candidate_id,
+            "goal_id": self.goal_id,
+            "gap_ids": list(self.gap_ids),
+            "source_task_ids": list(self.source_task_ids),
         }
 
     @classmethod
@@ -136,13 +145,16 @@ class InvestigationTask:
             allowed_tools=tuple(value.get("allowed_tools") or ()),
             depends_on=tuple(value.get("depends_on") or ()),
             payload=value.get("payload") or {},
+            candidate_id=value.get("candidate_id", ""),
+            goal_id=value.get("goal_id", ""),
+            gap_ids=tuple(value.get("gap_ids") or ()),
+            source_task_ids=tuple(value.get("source_task_ids") or ()),
         )
 
 
 @dataclass(frozen=True)
 class CaseExecutionConfig:
     case_task_limit: int = 2
-    server_task_cap: int = 4
     max_total_tasks: int = 100
     max_llm_calls: int = 200
     max_tool_calls: int = 200
@@ -150,11 +162,14 @@ class CaseExecutionConfig:
     candidate_limit: int = 100
     max_attempts: int = 3
     task_timeout: int = 120
+    max_worker_steps: int = 6
+    max_recheck_rounds: int = 2
+    max_context_facts: int = 100
+    max_context_chars: int = 32_000
 
     def __post_init__(self) -> None:
         values = {
             "case_task_limit": self.case_task_limit,
-            "server_task_cap": self.server_task_cap,
             "max_total_tasks": self.max_total_tasks,
             "max_llm_calls": self.max_llm_calls,
             "max_tool_calls": self.max_tool_calls,
@@ -162,23 +177,27 @@ class CaseExecutionConfig:
             "candidate_limit": self.candidate_limit,
             "max_attempts": self.max_attempts,
             "task_timeout": self.task_timeout,
+            "max_worker_steps": self.max_worker_steps,
+            "max_context_facts": self.max_context_facts,
+            "max_context_chars": self.max_context_chars,
         }
         for name, value in values.items():
             if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
                 raise ValueError(f"{name} must be a positive integer")
-        if self.case_task_limit > self.server_task_cap:
-            raise ValueError("case_task_limit exceeds server_task_cap")
+        if not isinstance(self.max_recheck_rounds, int) or isinstance(self.max_recheck_rounds, bool) or self.max_recheck_rounds < 0:
+            raise ValueError("max_recheck_rounds must be a nonnegative integer")
 
 
 class SharedResourceLimits:
     """Share one instance across case runs in a single application process."""
 
-    def __init__(self, llm_request_cap: int = 2, db_query_cap: int = 2) -> None:
-        for name, value in (("llm_request_cap", llm_request_cap), ("db_query_cap", db_query_cap)):
+    def __init__(self, llm_request_cap: int = 2, db_query_cap: int = 2, worker_cap: int = 4) -> None:
+        for name, value in (("llm_request_cap", llm_request_cap), ("db_query_cap", db_query_cap), ("worker_cap", worker_cap)):
             if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
                 raise ValueError(f"{name} must be a positive integer")
         self.llm = asyncio.Semaphore(llm_request_cap)
         self.database = asyncio.Semaphore(db_query_cap)
+        self.workers = asyncio.Semaphore(worker_cap)
 
 
 class SQLiteRunStore:
@@ -223,7 +242,6 @@ class SQLiteRunStore:
                     status TEXT NOT NULL,
                     result_json TEXT,
                     error TEXT,
-                    attempts INTEGER NOT NULL DEFAULT 0,
                     idempotency_key TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     PRIMARY KEY (run_id, task_id)
@@ -250,18 +268,60 @@ class SQLiteRunStore:
                     updated_at TEXT NOT NULL,
                     PRIMARY KEY (run_id, operation_key)
                 );
+                CREATE TABLE IF NOT EXISTS case_artifacts (
+                    run_id TEXT NOT NULL REFERENCES case_runs(run_id),
+                    artifact_id TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    content_json TEXT NOT NULL,
+                    PRIMARY KEY (run_id, artifact_id)
+                );
                 """
             )
-    def _connect(self) -> sqlite3.Connection:
+    @contextmanager
+    def _connect(self):
         connection = sqlite3.connect(self.path, timeout=30, isolation_level=None)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
         connection.execute("PRAGMA busy_timeout = 30000")
-        return connection
+        try:
+            yield connection
+        except BaseException:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def put_artifact(self, run_id, artifact_id, kind, content):
+        encoded = _json(content)
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            old = connection.execute("SELECT kind,content_json FROM case_artifacts WHERE run_id=? AND artifact_id=?", (run_id, artifact_id)).fetchone()
+            if old and tuple(old) != (kind, encoded):
+                raise PlanError(f"immutable artifact conflict: {artifact_id}")
+            connection.execute("INSERT OR IGNORE INTO case_artifacts VALUES(?,?,?,?)", (run_id, artifact_id, kind, encoded))
+            connection.commit()
+        return artifact_id
+
+    def artifact(self, run_id, artifact_id):
+        with self._connect() as connection:
+            row = connection.execute("SELECT content_json FROM case_artifacts WHERE run_id=? AND artifact_id=?", (run_id, artifact_id)).fetchone()
+        if row is None:
+            raise PlanError(f"unknown run artifact: {artifact_id}")
+        return json.loads(row[0])
+
+    def facts(self, run_id, ids=None):
+        with self._connect() as connection:
+            rows = connection.execute("SELECT artifact_id,content_json FROM case_artifacts WHERE run_id=? AND kind='fact'", (run_id,)).fetchall()
+        result = {row[0]: json.loads(row[1]) for row in rows}
+        if ids is None:
+            return result
+        if not set(ids) <= result.keys():
+            raise PlanError("unknown fact references")
+        return {fid: result[fid] for fid in ids}
 
     def prepare_task_projection(self, run_id, tasks, config, scope):
         """Initialize a plan projection; never infer recovery from task rows."""
-        validate_task_plan(tasks, max_total_tasks=config.max_total_tasks, scope=scope)
+        validate_task_plan(tasks, max_total_tasks=config.max_total_tasks, scope=scope, known_fact_ids=set(self.facts(run_id)))
         self.prepare_run(run_id, config, scope)
         with self._connect() as connection:
             for task in tasks:
@@ -270,7 +330,7 @@ class SQLiteRunStore:
                     (run_id, task.task_id, _json(task.to_dict()), f"{run_id}:{task.task_id}", _now()),
                 )
 
-    def admit(self, state, config, scope):
+    def admit(self, state, config, scope, *, snapshot=None):
         """Atomically persist admission and frozen limits before any execution."""
         encoded = _json(state)
         run_id = state["run_id"]
@@ -283,21 +343,23 @@ class SQLiteRunStore:
                 raise ValueError("legacy run requires its original application version")
             if run and (run[0] != scope_hash or run[1] != config_json):
                 raise ValueError("run_id is already bound to a different scope or budget configuration")
-            if admission and (admission[0] != encoded or admission[1] != "native-v2"):
+            if admission and (admission[0] != encoded or admission[1] != "native-v3"):
                 raise ValueError("run_id is already bound to a different plan, scope, or budget configuration")
             now = _now()
             connection.execute(
                 "INSERT OR IGNORE INTO case_runs(run_id,scope_hash,config_json,status,created_at,updated_at) VALUES(?,?,?,'running',?,?)",
                 (run_id, scope_hash, config_json, now, now),
             )
-            connection.execute("INSERT OR IGNORE INTO case_admissions VALUES(?,?,?)", (run_id, encoded, "native-v2"))
+            connection.execute("INSERT OR IGNORE INTO case_admissions VALUES(?,?,?)", (run_id, encoded, "native-v3"))
+            if snapshot is not None:
+                connection.execute("INSERT INTO case_artifacts VALUES(?,?,?,?)", (run_id, state["snapshot_ref"], "snapshot", _json(snapshot)))
             connection.commit()
 
     def admission(self, run_id):
         with self._connect() as connection:
             row = connection.execute("SELECT input_json,graph_version FROM case_admissions WHERE run_id=?", (run_id,)).fetchone()
-        if not row or row[1] != "native-v2":
-            raise ValueError("run has no native-v2 admission; legacy runs require their original application version")
+        if not row or row[1] != "native-v3":
+            raise ValueError("run has no native-v3 admission; legacy runs require their original application version")
         return json.loads(row[0])
 
     def mark_running(self, run_id):
@@ -310,8 +372,17 @@ class SQLiteRunStore:
             self.record_task_status(run_id, task_id, record["status"], result=record.get("result"), error=record.get("error"))
 
     def publish_report(self, run_id, report, status):
+        if status not in {"success", "partial"}:
+            raise ValueError("only completed reports may be published")
         with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute("SELECT cancel_requested FROM case_runs WHERE run_id=?", (run_id,)).fetchone()
+            if row is None:
+                raise KeyError("unknown run_id")
+            if row[0]:
+                raise asyncio.CancelledError
             connection.execute("UPDATE case_runs SET report_json=?,status=?,error=NULL,updated_at=? WHERE run_id=?", (_json(report),status,_now(),run_id))
+            connection.commit()
 
     def prepare_run(self, run_id: str, config: CaseExecutionConfig, scope: CaseTaskScope) -> None:
         """Create the immutable budget/scope ledger before any graph LLM call."""
@@ -342,7 +413,6 @@ class SQLiteRunStore:
                 "status": row["status"],
                 "result": json.loads(row["result_json"]) if row["result_json"] is not None else None,
                 "error": row["error"],
-                "attempts": row["attempts"],
                 "idempotency_key": row["idempotency_key"],
             }
             for row in rows
@@ -356,23 +426,16 @@ class SQLiteRunStore:
         *,
         result: Any = None,
         error: str | None = None,
-        increment_attempt: bool = False,
     ) -> None:
         if status not in {"pending", "running", "succeeded", "failed", "blocked"}:
             raise ValueError(f"unsupported task status: {status}")
-        result_json = _json(result) if status == "succeeded" else None
+        result_json = _json(result) if result is not None else None
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
-            if increment_attempt:
-                connection.execute(
-                    "UPDATE case_task_outcomes SET status = ?, result_json = ?, error = ?, attempts = attempts + 1, updated_at = ? WHERE run_id = ? AND task_id = ?",
-                    (status, result_json, error, _now(), run_id, task_id),
-                )
-            else:
-                connection.execute(
-                    "UPDATE case_task_outcomes SET status = ?, result_json = ?, error = ?, updated_at = ? WHERE run_id = ? AND task_id = ?",
-                    (status, result_json, error, _now(), run_id, task_id),
-                )
+            connection.execute(
+                "UPDATE case_task_outcomes SET status = ?, result_json = ?, error = ?, updated_at = ? WHERE run_id = ? AND task_id = ?",
+                (status, result_json, error, _now(), run_id, task_id),
+            )
             connection.commit()
 
     def reserve(self, run_id: str, resource: str, amount: int, config: CaseExecutionConfig) -> int:
@@ -428,7 +491,7 @@ class SQLiteRunStore:
             connection.commit()
 
     def finish_run(self, run_id: str, status: str, *, error: str | None = None) -> None:
-        if status not in {"success", "failed", "cancelled"}:
+        if status not in {"success", "partial", "failed", "cancelled"}:
             raise ValueError(f"unsupported run status: {status}")
         with self._connect() as connection:
             connection.execute(
@@ -446,7 +509,7 @@ class SQLiteRunStore:
             if row is None:
                 connection.rollback()
                 raise KeyError(f"unknown run_id: {run_id}")
-            if row["status"] in {"success", "failed", "cancelled"}:
+            if row["status"] in {"success", "partial", "failed", "cancelled"}:
                 connection.rollback()
                 return False
             connection.execute(
@@ -502,7 +565,7 @@ class SQLiteRunStore:
                 "tool_calls": int(row["tool_calls"]),
                 "reserved_tokens": int(row["reserved_tokens"]),
             },
-            "report": json.loads(row["report_json"]) if row["report_json"] is not None else None,
+            "report_available": row["report_json"] is not None,
             "event_count": self._event_count(run_id),
         }
 
@@ -521,11 +584,11 @@ class SQLiteRunStore:
                 (run_id, node, status, _json(dict(payload or {})), _now()),
             )
 
-    def list_events(self, run_id: str) -> list[dict[str, Any]]:
+    def list_events(self, run_id: str, *, after_id: int = 0) -> list[dict[str, Any]]:
         with self._connect() as connection:
             rows = connection.execute(
-                "SELECT event_id, node, status, payload_json, created_at FROM case_run_events WHERE run_id = ? ORDER BY event_id",
-                (run_id,),
+                "SELECT event_id, node, status, payload_json, created_at FROM case_run_events WHERE run_id = ? AND event_id > ? ORDER BY event_id",
+                (run_id, after_id),
             ).fetchall()
         return [
             {
@@ -622,6 +685,7 @@ class TaskExecutionContext:
         callback: Callable[..., Awaitable[Any]],
         *args: Any,
         max_output_tokens: int,
+        input_tokens_upper_bound: int = 0,
         **kwargs: Any,
     ) -> Any:
         if not isinstance(max_output_tokens, int) or isinstance(max_output_tokens, bool) or max_output_tokens <= 0:
@@ -631,69 +695,18 @@ class TaskExecutionContext:
         async with self.resources.llm:
             if self.store.is_cancel_requested(self.run_id):
                 raise asyncio.CancelledError
-            self.store.reserve_llm(self.run_id, max_output_tokens, self.config)
+            if not isinstance(input_tokens_upper_bound, int) or isinstance(input_tokens_upper_bound, bool) or input_tokens_upper_bound < 0:
+                raise ValueError("input_tokens_upper_bound must be nonnegative")
+            self.store.reserve_llm(self.run_id, input_tokens_upper_bound + max_output_tokens, self.config)
             return await _invoke_async(callback, *args, **kwargs)
 
-    async def tool_call(self, callback: Callable[..., Any], *args: Any, tool_name: str, **kwargs: Any) -> Any:
-        if not isinstance(tool_name, str) or tool_name not in self.task.allowed_tools:
-            raise PlanError(f"task {self.task.task_id} attempted a non-whitelisted tool")
-        def authorize():
-            if self.store.is_cancel_requested(self.run_id):
-                raise asyncio.CancelledError
-            self.store.reserve(self.run_id, "tool_calls", 1, self.config)
+    scope: CaseTaskScope | None = None
+    tools: Any = None
 
-        return await _invoke_tool(self.resources.database, callback, authorize, *args, **kwargs)
-
-    async def idempotent_tool_call(
-        self,
-        callback: Callable[..., Any],
-        *args: Any,
-        tool_name: str,
-        operation: str,
-        **kwargs: Any,
-    ) -> Any:
-        """Execute an external write once and cache its result by stable key.
-
-        The downstream callback must accept ``idempotency_key`` and pass it to
-        the external service.  If the process dies after that service accepts
-        the request but before the local result commit, the next attempt is
-        rejected as uncertain rather than duplicated.
-        """
-        if not isinstance(operation, str) or not operation.strip():
-            raise ValueError("operation must be a non-empty string")
-        if not isinstance(tool_name, str) or tool_name not in self.task.allowed_tools:
-            raise PlanError(f"task {self.task.task_id} attempted a non-whitelisted tool")
-        if self.store.is_cancel_requested(self.run_id):
-            raise asyncio.CancelledError
-        operation_key = f"{self.idempotency_key}:{operation.strip()}"
-        state, cached = self.store.begin_effect(self.run_id, operation_key)
-        if state == "cached":
-            return cached
-        if state == "uncertain":
-            raise ExternalOperationUncertain(
-                f"external operation requires reconciliation before retry: {operation_key}"
-            )
-        dispatched = False
-        def authorize():
-            nonlocal dispatched
-            if self.store.is_cancel_requested(self.run_id):
-                raise asyncio.CancelledError
-            self.store.reserve(self.run_id, "tool_calls", 1, self.config)
-            dispatched = True
-
-        try:
-            value = await _invoke_tool(
-                self.resources.database, callback, authorize, *args,
-                idempotency_key=operation_key, **kwargs,
-            )
-            self.store.complete_effect(self.run_id, operation_key, value)
-            return value
-        except BaseException as exc:
-            # Before dispatch nothing reached the provider. After dispatch, even
-            # cancellation/timeout may hide a committed write: keep it uncertain.
-            if not dispatched:
-                self.store.fail_effect(self.run_id, operation_key, type(exc).__name__)
-            raise
+    async def execute_tool(self, request):
+        if self.tools is None or self.scope is None:
+            raise PlanError("an authorized tool registry and scope are required")
+        return await self.tools.execute(request, self)
 
 
 @dataclass(frozen=True)
@@ -710,6 +723,7 @@ class RunExecutionContext:
         callback: Callable[..., Awaitable[Any]],
         *args: Any,
         max_output_tokens: int,
+        input_tokens_upper_bound: int = 0,
         **kwargs: Any,
     ) -> Any:
         if not isinstance(max_output_tokens, int) or isinstance(max_output_tokens, bool) or max_output_tokens <= 0:
@@ -719,7 +733,9 @@ class RunExecutionContext:
         async with self.resources.llm:
             if self.store.is_cancel_requested(self.run_id):
                 raise asyncio.CancelledError
-            self.store.reserve_llm(self.run_id, max_output_tokens, self.config)
+            if not isinstance(input_tokens_upper_bound, int) or isinstance(input_tokens_upper_bound, bool) or input_tokens_upper_bound < 0:
+                raise ValueError("input_tokens_upper_bound must be nonnegative")
+            self.store.reserve_llm(self.run_id, input_tokens_upper_bound + max_output_tokens, self.config)
             return await _invoke_async(callback, *args, **kwargs)
 
 
@@ -728,6 +744,7 @@ def validate_task_plan(
     *,
     max_total_tasks: int,
     scope: CaseTaskScope,
+    known_fact_ids: set[str] | None = None,
 ) -> tuple[str, ...]:
     if not isinstance(scope, CaseTaskScope):
         raise PlanError("an authoritative CaseTaskScope is required")
@@ -746,7 +763,7 @@ def validate_task_plan(
             raise PlanError(f"task {task.task_id} references an entity outside the case")
         if not task.basis_fact_ids:
             raise PlanError(f"task {task.task_id} must cite at least one supporting Fact")
-        if not set(task.basis_fact_ids).issubset(scope.fact_ids):
+        if not set(task.basis_fact_ids).issubset(known_fact_ids or set()):
             raise PlanError(f"task {task.task_id} references an unknown Fact")
         if not set(task.allowed_tools).issubset(scope.allowed_tools):
             raise PlanError(f"task {task.task_id} requests a tool outside the case whitelist")

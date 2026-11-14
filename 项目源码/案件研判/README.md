@@ -1,100 +1,69 @@
-# model_insight_agent：证据优先的模型研判 Agent
+# 案件研判：LangGraph 原生业务闭环
 
-这是从实习项目整理出的公开学习版，保留核心源码、Agent 设计与质量工程思路，去除了真实数据库快照、运行产物、账号密码、API Key、内网地址和真实案例报告。
-
-质量规划器通过 OpenAI 兼容接口调用模型。`LLM_PRIMARY_PROVIDER` 描述服务协议，
-`LLM_PRIMARY_MODEL` 描述实际模型。若本地部署千问，请将 provider 设为
-`openai-compatible`，并把 `LLM_PRIMARY_BASE_URL` 指向服务端的 `/v1` 端点。
-千问是模型，OpenAI-compatible 是推理服务暴露的 HTTP 接口约定。
-
-## 项目解决什么问题
-
-系统把“模型结果快照”转成可追溯的研判报告：
+公开学习版以服务端授权的模型结果为输入，确定性代码计算事实，模型提出候选、核查计划与证据判断。**业务策略自定义，任务执行、重试、超时和恢复复用 LangGraph。** API、CLI 使用同一条完整案件图，不再提供旧 Agent Loop、QualityEngine 或独立任务执行器入口。
 
 ```text
-受控快照
-  → 目录与字段契约
-  → 确定性 Fact 计算
-  → 受控策略路由
-  → 白名单工具补证
-  → Evidence Chain / Claim 校验
-  → Markdown 报告与机器回放证据
+服务端案件仓库 → 结构化事实
+                    ↓
+             规则通道 ∥ LLM 通道
+                    ↓
+          校验 / 去重 / 有界候选选择
+                    ↓
+      核查目标与信息需求 → TaskPlan
+                    ↓
+       依赖就绪判断 → Send(Worker)
+                    ↓
+       Worker: Planner → Tool → Judge
+                    ↑        条件边 ↓
+                    └──── 继续查询
+                    ↓
+             集中核验每项信息需求
+                    ↓
+      独立证据缺口 → 有限轮定向补证 → 再核验
+                    ↓
+         同一报告 → JSON / Markdown / HTML / DOCX
 ```
 
-核心边界是：金额、次数、时间、TopK 和关系指标由确定性代码计算；大模型只在受控上下文中参与假设生成、工具选择、证据判断和报告叙事，不能直接读取全量原始数据、生成 SQL 或凭空创造事实。
+## 运行
 
-## 目录
-
-- `src/`：事实包、策略路由、Agent Loop、工具注册、证据链、报告投影和质量流水线。
-- `tests/`：单元测试、恢复/回放、断言校验和异常输入测试。部分质量测试依赖原项目的私有快照，公开版没有附带该数据。
-- `docs/design/`：模型级 Investigation Agent、专属工具、上下文压缩和整体方案设计。
-- `docs/execution/`：接口契约、验收边界和生命周期约束。
-- `docs/quality_pipeline.md`：离线质量流水线说明。
-- `docs/schemas/`：报告结构契约。
-- `src/case_api.py`：异步提交、状态、取消、报告读取和 SSE 事件接口；默认处理脱敏/合成输入，并可从结构化事实与模型线索生成候选风险疑点。
-- `configs/example_strategy.yaml`：脱敏后的策略示例，不包含真实记录。
-- `configs/example_evaluation_protocol.yaml`：用于说明 baseline、完整策略和单项 ablation 如何冻结评测控制条件。
-- `AI_CONTEXT.md`：供 ChatGPT 或其他编程助手快速理解项目的上下文入口。
-
-## 公开版的边界
-
-公开版刻意不包含：
-
-- `.env`、秘钥文件和任何真实凭据；
-- 数据库/前端平台地址、真实账号和密码；
-- 原始 JSONL/数据库快照、真实身份证号、卡号、手机号、姓名和交易记录；
-- `output/`、`artifacts/` 等运行产物；
-- 真实案例报告、现场排期和个人工作记录。
-
-本仓库中的案例编号、模型编号和字段名只用于说明代码结构，不应被解释为生产数据或业务效果证明。
-
-## Case run API
-
-`src.case_api:app` 提供 `POST /v1/case-runs`、状态/取消/报告端点和
-`GET /v1/case-runs/{run_id}/events` SSE，并提供 `POST /v1/case-runs/{run_id}/resume`。任务执行、重试与恢复由 LangGraph 原生子图负责；SQLite `case_task_outcomes` 任务行是查询投影，检查点默认写入独立 SQLite 文件；真实 Planner、Worker、Verifier、GaussDB
-连接和报告投影通过 `CaseRunService` 注入。公开版的默认服务不包含生产数据库、
-专家标注或线上指标。任务可以显式提供候选风险疑点，也可以把脱敏 fact pack 和
-结构化 model clues 交给 `src.candidate_events.py` 生成带来源、事实引用和风险
-标签的候选风险疑点；不会把疑点当成已经证实的风险事件。集中核验前统一执行疑点校验与
-`candidate_limit` 疑点数量限额。服务入口对每个 Task 复用 `src.case_worker_subgraph.py`
-的隔离补证子图；验证缺口可由 `src.directed_supplement.py` 转成范围受限的
-recheck Task；外部写操作可通过
-`TaskExecutionContext.idempotent_tool_call()` 走 SQLite 幂等账本。
-为了让公开版能够离线演示这条闭环，合成任务可以在 payload 中提供结构化
-`verification.gaps`；补证任务执行后没有新的缺口即视为该缺口已处理。这个输入边界
-只用于脱敏测试，生产环境仍由授权的 Verifier 和补证工具返回结果。
-
-## 本地准备
+Python 3.11+，在本目录执行。运行数据库、下载数据和本地凭据不提交。
 
 ```powershell
 python -m venv .venv
-\.venv\Scripts\python -m pip install -r requirements.txt
-\.venv\Scripts\python -m compileall src
+.venv\Scripts\python -m pip install -r requirements.txt
+.venv\Scripts\python -B -m pytest -q -p no:cacheprovider
+.venv\Scripts\python -m src.case_cli --case-id synthetic --repository examples/cases --storage runtime/demo --offline --report output/report.json
 ```
 
-需要运行质量流水线时，请先准备经授权的、脱敏的快照，并通过 `--data-dir` 显式传入；不要把快照提交到 GitHub。
+该示例数据明确为合成数据。`--offline` 运行真实的规则、事实和工具节点，但不提供语义发现与核验：语义通道标记 unavailable_offline，候选保留证据缺口，报告为 partial，绝不把候选直接升级为已验证事件。
 
-## 推荐阅读顺序
+在线模式配置服务端 `CASE_LLM_MODEL`、`CASE_LLM_API_KEY`，可选 `CASE_LLM_BASE_URL`；然后去掉 `--offline`。这是实际异步 OpenAI 兼容适配器，不是返回 initial_tasks 的回调示例。SDK 重试关闭，各节点通过 LangGraph RetryPolicy 重试。模型必须支持文本 JSON 输出，字段仍由 Pydantic 和业务规则校验。模型判断是辅助推断，不能替代人工复核。
 
-1. `AI_CONTEXT.md`
-2. `docs/design/核心Agent架构决策与实施路线.md`
-3. `docs/design/模型级Investigation-Agent详细设计.md`
-4. `docs/design/专属工具详细设计.md`
-5. `docs/design/上下文压缩策略详细设计.md`
-6. `src/agent_loop.py`、`src/evidence_chain.py`、`src/final_agent_report.py`
-7. `docs/execution/api_contract.md` 与 `docs/schemas/report.schema.json`
+API 只在 lifespan 中创建服务、数据库与恢复线程，模块导入无这些副作用：
 
-## 给 ChatGPT 的使用方式
+```powershell
+$env:CASE_REPOSITORY=(Resolve-Path examples/cases).Path
+$env:CASE_RUNTIME_DIR='runtime/api'
+$env:CASE_REASONER='offline'  # 在线模式删除该变量并配置模型
+.venv\Scripts\python -m uvicorn src.case_api:app --host 127.0.0.1 --port 8000
+```
 
-先让模型阅读 `AI_CONTEXT.md`，再指定要分析的模块或设计问题。涉及代码修改时，要求它先说明事实边界、输入输出契约、测试影响和是否需要真实数据；不要让它猜测私有数据库内容或凭空补齐业务指标。
+提交 JSON 为 `{"case_id":"synthetic"}`，不接受客户端自授的 case_scope、tasks 或 verification。完整 API 见 [接口契约](docs/execution/api_contract.md)。CLI 的 `--report` 根据后缀支持 .json/.md/.html/.docx；API 通过 `report?format=...` 导出。
 
+## 实现入口
 
-## 原生任务运行机制
+- [架构与恢复语义](docs/execution/native_task_runtime.md)：唯一执行链、原生子图与 @task 的边界。
+- [契约](src/investigation_contracts.py)：Fact、Candidate、Goal、TaskPlan、ToolRequest、Assessment、Gap、Report。
+- [业务函数](src/investigation_domain.py)：接入已有字段、统计、实体画像、异常规则；检查事实引用与集中核验。
+- [数据仓库](src/case_repository.py)：FileCaseRepository；RowSourceCaseRepository 可接现有参数化 DbRowSource，并按服务端策略筛选、限行，固化本次快照。
+- [受控工具](src/investigation_tools.py)：统一校验任务/案件白名单、实体、时间、模型、参数 schema，再扣预算并执行；保留原专属补证工具。
+- [案件图](src/case_workflow_graph.py)、[任务图](src/case_task_graph.py)、[Worker 图](src/case_worker_subgraph.py)。
+- [验收范围](docs/execution/acceptance_criteria.md)、[简历指标边界](docs/execution/resume_alignment_acceptance.md)。
 
-案件图的 dispatch 调用 LangGraph 任务子图：`resolve_ready → Send(worker) → resolve_ready`。
-业务层校验任务及依赖，框架负责并发执行、重试、超时和检查点恢复。结果按 Task ID 合并，
-失败的前置任务阻断其全部后代；独立任务继续执行。采用 superstep 汇合语义。
+## 数据与部署边界
 
-`src/case_execution.py` 保存业务契约、原子预算、外部操作幂等和 API 投影；
-`src/case_task_graph.py` 定义原生任务子图，任务入口只有这一条 LangGraph 路径。详细边界、恢复方式与验证见
-[原生任务运行说明](docs/execution/native_task_runtime.md)。
+默认仓库读取管理员准备的规范化 JSON；数据库入口由宿主注入 RowSourceCaseRepository 和授权策略。任务运行始终使用准入时固化的快照，重启不重新读取可能变更的输入。新增事实只追加到本次运行的事实库，不扩大授权范围。State 保存事实 ID、紧凑候选与结果引用，大对象保存在证据存储中。
+
+本服务是本地、单进程 SQLite 部署，不能直接作为公开多租户接口；身份认证与逐案件访问授权应由宿主系统绑定 repository 和 API 完成。每个运行库只允许一个服务持有恢复锁。并发额度在同一事件循环内共享，不承诺跨机器限流或零重复外部副作用。部署要求和迁移说明见运行文档。
+
+真实数据库、专家 Gold、生产凭据和真实案件不在公开仓库。合成端到端测试证明机制，不证明生产准确率、耗时或简历指标。

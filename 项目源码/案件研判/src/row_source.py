@@ -278,13 +278,7 @@ class SnapshotRowSource(RowSource):
     def _effective_case_id(self, case_id: int, model_ids: list[int]) -> int:
         if case_id in self._available_cases:
             return case_id
-        if self._available_cases:
-            fallback = self._available_cases[0]
-            warning = f"requested case_id={case_id} was absent in snapshot; using sampled case_id={fallback}"
-            if warning not in self.warnings:
-                self.warnings.append(warning)
-            return fallback
-        return case_id
+        raise KeyError(f"case_id={case_id} is absent in the authorized snapshot")
 
     def iter_model_rows(self, case_id: int, model_id: int) -> Iterable[tuple[Any, dict[str, Any]]]:
         effective_case = self._effective_case_id(case_id, [model_id])

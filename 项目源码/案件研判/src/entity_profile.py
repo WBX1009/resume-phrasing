@@ -94,6 +94,7 @@ class EntityAccumulator:
     accounts: dict[str, set[str]] = field(default_factory=lambda: {"accounts": set(), "phones": set()})
     near_threshold_count: int = 0
     same_day_same_amount_max: float = 0.0
+    same_day_amount_peers: dict[tuple[str, float], set[str]] = field(default_factory=dict)
     evidence: list[dict[str, Any]] = field(default_factory=list)
 
     def add_amount(
@@ -321,6 +322,10 @@ def build_model_profiles(
                     item.direction_counts[direction] += 1
             for value in _field_values(payload, counterparty_fields):
                 item.counterparty_counts[value] += 1
+                if dt and has_calendar_date and amount is not None:
+                    peers = item.same_day_amount_peers.setdefault((dt.strftime("%Y-%m-%d"), amount), set())
+                    peers.add(value)
+                    item.same_day_same_amount_max = max(item.same_day_same_amount_max, len(peers))
             if category_field:
                 value = clean_value(payload.get(category_field))
                 if value:

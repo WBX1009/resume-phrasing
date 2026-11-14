@@ -1,0 +1,122 @@
+{
+  "case_id": "synthetic",
+  "entity_ids": [
+    "p"
+  ],
+  "time_range": [
+    "2025-01-01T00:00:00",
+    "2025-01-02T00:00:00"
+  ],
+  "allowed_tools": [
+    "query_records",
+    "entity_model_slice",
+    "same_amount_window_probe"
+  ],
+  "models": [
+    {
+      "model_id": 1,
+      "name": "synthetic-1",
+      "records": [
+        {
+          "row_id": "1-0",
+          "entity_ids": [
+            "p"
+          ],
+          "occurred_at": "2025-01-01T10:00:00",
+          "data": {
+            "姓名": "p",
+            "交易对手": "peer-0",
+            "交易金额": 100,
+            "交易时间": "2025-01-01T10:00:00"
+          }
+        },
+        {
+          "row_id": "1-1",
+          "entity_ids": [
+            "p"
+          ],
+          "occurred_at": "2025-01-01T10:01:00",
+          "data": {
+            "姓名": "p",
+            "交易对手": "peer-1",
+            "交易金额": 100,
+            "交易时间": "2025-01-01T10:01:00"
+          }
+        }
+      ],
+      "strategy": {
+        "model_kind": "entity",
+        "person_fields": [
+          "姓名"
+        ],
+        "counterparty_fields": [
+          "交易对手"
+        ],
+        "primary_amount_field": "交易金额",
+        "time_fields": [
+          "交易时间"
+        ],
+        "anomaly_rules": [
+          "same_day_same_amount"
+        ],
+        "allowed_tools": [
+          "entity_model_slice",
+          "same_amount_window_probe"
+        ]
+      }
+    },
+    {
+      "model_id": 2,
+      "name": "synthetic-2",
+      "records": [
+        {
+          "row_id": "2-0",
+          "entity_ids": [
+            "p"
+          ],
+          "occurred_at": "2025-01-01T10:00:00",
+          "data": {
+            "姓名": "p",
+            "交易对手": "peer-0",
+            "交易金额": 100,
+            "交易时间": "2025-01-01T10:00:00"
+          }
+        },
+        {
+          "row_id": "2-1",
+          "entity_ids": [
+            "p"
+          ],
+          "occurred_at": "2025-01-01T10:01:00",
+          "data": {
+            "姓名": "p",
+            "交易对手": "peer-1",
+            "交易金额": 100,
+            "交易时间": "2025-01-01T10:01:00"
+          }
+        }
+      ],
+      "strategy": {
+        "model_kind": "entity",
+        "person_fields": [
+          "姓名"
+        ],
+        "counterparty_fields": [
+          "交易对手"
+        ],
+        "primary_amount_field": "交易金额",
+        "time_fields": [
+          "交易时间"
+        ],
+        "anomaly_rules": [
+          "same_day_same_amount"
+        ],
+        "allowed_tools": [
+          "entity_model_slice",
+          "same_amount_window_probe"
+        ]
+      }
+    }
+  ],
+  "data_label": "synthetic_demo_only"
+}

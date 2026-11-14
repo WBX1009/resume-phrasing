@@ -1,0 +1,42 @@
+name: Case investigation
+
+on:
+  push:
+    paths:
+      - '项目源码/案件研判/**'
+      - '.github/workflows/case-investigation.yml'
+  pull_request:
+    paths:
+      - '项目源码/案件研判/**'
+      - '.github/workflows/case-investigation.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: 项目源码/案件研判
+    env:
+      PYTHONIOENCODING: utf-8
+      PYTHONUTF8: '1'
+      LANGGRAPH_STRICT_MSGPACK: 'true'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: 项目源码/案件研判/requirements.txt
+      - run: python -m pip install -r requirements.txt
+      - run: python -m pip install -e . --no-deps
+      - run: python -B -m compileall -q src tests
+      - run: python -B -m pytest -q -p no:cacheprovider

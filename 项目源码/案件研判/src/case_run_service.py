@@ -1,90 +1,51 @@
-"""Application service for submitting and observing case investigations.
-
-LangGraph owns task execution and checkpoint recovery; SQLite owns budgets and API projections.  This service adds the
-missing process boundary: asynchronous submission, cooperative cancellation,
-SQLite-backed status/report reads, a durable LangGraph checkpointer, and an
-SSE-friendly event stream.
-"""
-
+"""One case service: durable admission, native graph recovery, read projections."""
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable, Iterator, Mapping, Sequence
-from concurrent.futures import Future, wait
-from copy import deepcopy
-import inspect
+from collections.abc import Mapping
+from typing import Any
+from concurrent.futures import wait
 import json
+import logging
 from pathlib import Path
 import threading
 import time
-from typing import Any
 from uuid import uuid4
 
 from langgraph.runtime import RunControl
 from langgraph.errors import GraphDrained
+from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 
-from .case_task_graph import CaseTaskExecutor
-from .case_execution import (
-    CaseTaskScope,
-    InvestigationTask,
-    RunExecutionContext,
-    SharedResourceLimits,
-    SQLiteRunStore,
-    TaskExecutionContext,
-    CaseExecutionConfig,
-)
+from .case_task_graph import CaseTaskExecutor, scope_from_state
+from .case_execution import CaseExecutionConfig, SQLiteRunStore, SharedResourceLimits, InvestigationTask, PlanError, _invoke_tool
+from .case_repository import CaseRepository
+from .investigation_tools import InvestigationTools
 
-
-Callback = Callable[..., Any]
+TERMINAL = {"success", "partial", "failed", "cancelled"}
 
 
 class CaseRunService:
-    """Run one or more graph-backed case investigations in the background."""
-
-    def __init__(
-        self,
-        store: SQLiteRunStore,
-        *,
-        worker: Callback,
-        planner: Callback,
-        verifier: Callback,
-        recheck_planner: Callback,
-        recheck_allowed: Callback,
-        summarizer: Callback,
-        config: CaseExecutionConfig = CaseExecutionConfig(),
-        resources: SharedResourceLimits | None = None,
-        checkpoint_path: Path | str | None = None,
-    ) -> None:
-        if not inspect.iscoroutinefunction(worker):
-            raise TypeError("worker must be an async callable")
-        self.store = store
-        self._claim_store()
-        self._worker = worker
-        self._planner = planner
-        self._verifier = verifier
-        self._recheck_planner = recheck_planner
-        self._recheck_allowed = recheck_allowed
-        self._summarizer = summarizer
+    def __init__(self, store: SQLiteRunStore, *, repository: CaseRepository, reasoner,
+                 tools=None, config=CaseExecutionConfig(), resources=None, checkpoint_path=None):
+        self.store, self.repository, self.reasoner = store, repository, reasoner
+        self.tools = tools or InvestigationTools(store)
         self._config = config
         self._resources = resources or SharedResourceLimits()
-        self.checkpoint_path = Path(checkpoint_path or store.path.with_name("langgraph_checkpoints.sqlite3"))
+        self.checkpoint_path = Path(checkpoint_path or store.path.with_name("langgraph-v3.sqlite3"))
         self.checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
-        self.executor = CaseTaskExecutor(
-            store,
-            self._guarded_worker,
-            config=config,
-            resources=self._resources,
-        )
+        self.executor = CaseTaskExecutor(store, reasoner, self.tools, config=config, resources=self._resources)
+        self._claim_store()
         self._loop = asyncio.new_event_loop()
         self._thread = threading.Thread(target=self._loop.run_forever, name="case-runs", daemon=True)
-        self._thread.start()
-        self._futures: dict[str, Future[Any]] = {}
+        self._futures = {}
+        self._controls = {}
         self._lock = threading.RLock()
-        self._controls: dict[str, RunControl] = {}
+        self._changed = threading.Condition()
         self._closing = False
+        self._thread.start()
         try:
             self.recover_pending()
-        except Exception:
+        except BaseException:
             self.close()
             raise
 
@@ -107,175 +68,117 @@ class CaseRunService:
             self._ownership.close()
             raise ValueError("run database already has an active service owner") from exc
 
-    def submit(self, state: Mapping[str, Any]) -> dict[str, Any]:
-        payload = deepcopy(dict(state))
-        run_id = str(payload.get("run_id") or uuid4().hex)
-        payload["run_id"] = run_id
-        self._validate_submission(payload)
-        scope = _scope_from_state(payload)
+    def _track(self, run_id, coroutine):
+        future = asyncio.run_coroutine_threadsafe(coroutine, self._loop)
+        self._futures[run_id] = future
+        def finished(done):
+            with self._lock:
+                if self._futures.get(run_id) is done:
+                    self._futures.pop(run_id, None)
+            self._notify()
+        future.add_done_callback(finished)
+
+    def _notify(self):
+        with self._changed:
+            self._changed.notify_all()
+
+    def submit(self, case_id: str, *, run_id: str | None = None):
+        if not isinstance(case_id, str) or not case_id.strip():
+            raise PlanError("case_id must be a non-empty string")
+        run_id = run_id or uuid4().hex
+        if not isinstance(run_id, str) or not run_id.strip():
+            raise PlanError("run_id must be a non-empty string")
+        if threading.current_thread() is self._thread:
+            raise RuntimeError("submit must be called outside the service event loop")
+        async def load_authorized_snapshot():
+            return await _invoke_tool(self._resources.database, self.repository.load, lambda: None, case_id)
         with self._lock:
             if self._closing:
                 raise ValueError("service is closed")
-            existing = self.store.get_run(run_id)
-            if existing:
-                raise ValueError(f"run_id already exists: {run_id}")
-            self.store.admit(payload, self._config, scope)
-            future = asyncio.run_coroutine_threadsafe(self._run_guarded(payload), self._loop)
-            self._futures[run_id] = future
+            if self.store.get_run(run_id):
+                raise ValueError("run_id already exists")
+        snapshot = asyncio.run_coroutine_threadsafe(load_authorized_snapshot(), self._loop).result()
+        if snapshot.case_id != case_id:
+            raise PlanError("repository returned another case")
+        if not set(snapshot.allowed_tools) <= self.tools.names():
+            raise PlanError("case permits an unregistered tool")
+        state = {"case_id": case_id, "run_id": run_id, "snapshot_ref": snapshot.reference(),
+                 "case_scope": snapshot.scope().to_dict()}
+        with self._lock:
+            if self._closing:
+                raise ValueError("service is closed")
+            if self.store.get_run(run_id):
+                raise ValueError("run_id already exists")
+            self.store.admit(state, self._config, snapshot.scope(), snapshot=snapshot.model_dump(mode="json"))
+            self._track(run_id, self._run_guarded(state))
         return {"run_id": run_id, "status": "running"}
 
-    def status(self, run_id: str) -> dict[str, Any] | None:
+    def status(self, run_id):
         return self.store.get_run(run_id)
 
-    def cancel(self, run_id: str) -> bool:
-        return self.store.request_cancel(run_id)
+    def cancel(self, run_id):
+        result = self.store.request_cancel(run_id)
+        self._notify()
+        return result
 
-    def report(self, run_id: str) -> dict[str, Any] | None:
+    def report(self, run_id):
         return self.store.load_report(run_id)
 
-    def iter_sse_events(
-        self,
-        run_id: str,
-        *,
-        poll_interval: float = 0.1,
-        timeout_seconds: float = 3600.0,
-    ) -> Iterator[str]:
-        """Yield status/task changes until the run reaches a terminal state."""
-        deadline = time.monotonic() + timeout_seconds
-        last_snapshot: str | None = None
+    def fact(self, run_id, fact_id):
+        # Only graph-committed evidence is exposed, not orphan artifacts from a
+        # crashed node before its checkpoint. Run access belongs to the host API.
+        report = self.report(run_id)
+        if not report or fact_id not in report["fact_ids"]:
+            raise KeyError("fact not referenced by a published report")
+        return self.store.facts(run_id, [fact_id])[fact_id]
+
+    def iter_sse_events(self, run_id, *, poll_interval=.5, timeout_seconds=3600):
+        deadline, last, cursor = time.monotonic()+timeout_seconds, None, 0
         while time.monotonic() <= deadline:
             record = self.status(run_id)
             if record is None:
-                yield _sse("error", {"run_id": run_id, "error": "unknown_run_id"})
+                yield _sse("error", {"error": "unknown_run_id"})
                 return
-            snapshot = self._event_snapshot(run_id, record)
+            # Projections are optional read models. Never deserialize their
+            # task spec or use them for scheduling/recovery.
+            with self.store._connect() as connection:
+                rows = connection.execute("SELECT task_id,status,error FROM case_task_outcomes WHERE run_id=? ORDER BY task_id", (run_id,)).fetchall()
+            events = self.store.list_events(run_id, after_id=cursor)
+            if events:
+                cursor = events[-1]["event_id"]
+            snapshot = {"run": record, "tasks": [dict(r) for r in rows], "events": events}
             encoded = json.dumps(snapshot, ensure_ascii=False, sort_keys=True)
-            if encoded != last_snapshot:
-                last_snapshot = encoded
+            if encoded != last:
+                last = encoded
                 yield _sse("status", snapshot)
-            if record["status"] in {"success", "failed", "cancelled"}:
+            if record["status"] in TERMINAL:
                 yield _sse("complete", snapshot)
                 return
-            time.sleep(max(0.01, poll_interval))
-        yield _sse("error", {"run_id": run_id, "error": "event_stream_timeout"})
-
-    def _event_snapshot(self, run_id: str, record: Mapping[str, Any]) -> dict[str, Any]:
-        tasks = self.store.load_task_projection(run_id)
-        return {
-            "run": dict(record),
-            "tasks": [
-                {
-                    "task_id": task_id,
-                    "status": value["status"],
-                    "error": value["error"],
-                    "attempts": value["attempts"],
-                    "result": value["result"],
-                }
-                for task_id, value in sorted(tasks.items())
-            ],
-            "events": self.store.list_events(run_id),
-        }
-
-    def _validate_submission(self, state: Mapping[str, Any]) -> None:
-        for key in ("case_id", "case_facts", "case_scope"):
-            if key not in state:
-                raise ValueError(f"submission is missing {key}")
-        if not isinstance(state["case_id"], str) or not state["case_id"].strip():
-            raise ValueError("case_id must be a non-empty string")
-        if not isinstance(state["case_facts"], Mapping):
-            raise ValueError("case_facts must be a mapping")
-        if "initial_tasks" not in state or not isinstance(state["initial_tasks"], Sequence) or isinstance(state["initial_tasks"], (str, bytes)):
-            raise ValueError("initial_tasks must be a sequence")
-        for item in state["initial_tasks"]:
-            if not isinstance(item, (InvestigationTask, Mapping)):
-                raise ValueError("initial_tasks must contain task mappings")
-        state["initial_tasks"] = [item.to_dict() if isinstance(item, InvestigationTask) else dict(item) for item in state["initial_tasks"]]
-        _scope_from_state(state)
-
-    async def _guarded_worker(
-        self,
-        task: InvestigationTask,
-        task_input: dict[str, Any],
-        context: TaskExecutionContext,
-    ) -> Any:
-        self._raise_if_cancelled(context.run_id)
-        self.store.record_event(context.run_id, f"task:{task.task_id}", "started")
-        try:
-            result = await self._worker(task, task_input, context)
-            self._raise_if_cancelled(context.run_id)
-        except asyncio.CancelledError:
-            self.store.record_event(context.run_id, f"task:{task.task_id}", "cancelled")
-            raise
-        except Exception as exc:
-            self.store.record_event(
-                context.run_id,
-                f"task:{task.task_id}",
-                "failed",
-                {"error": type(exc).__name__},
-            )
-            raise
-        self.store.record_event(context.run_id, f"task:{task.task_id}", "succeeded")
-        return result
-
-    async def _guarded_callback(
-        self,
-        node_name: str,
-        callback: Callback,
-        state: Mapping[str, Any],
-        context: RunExecutionContext | None = None,
-    ) -> Any:
-        run_id = str(state["run_id"])
-        self._raise_if_cancelled(run_id)
-        self.store.record_event(run_id, node_name, "started")
-        try:
-            value = callback(state, context) if context is not None else callback(state)
-            if inspect.isawaitable(value):
-                value = await value
-            self._raise_if_cancelled(run_id)
-        except asyncio.CancelledError:
-            self.store.record_event(run_id, node_name, "cancelled")
-            raise
-        except Exception as exc:
-            self.store.record_event(
-                run_id,
-                node_name,
-                "failed",
-                {"error": type(exc).__name__},
-            )
-            raise
-        self.store.record_event(run_id, node_name, "succeeded")
-        return value
-
-    def _raise_if_cancelled(self, run_id: str) -> None:
-        if self.store.is_cancel_requested(run_id):
-            raise asyncio.CancelledError
+            with self._changed:
+                self._changed.wait(timeout=max(.05,poll_interval))
+        yield _sse("error", {"error": "event_stream_timeout"})
 
     def recover_pending(self):
-        """Startup recovery for this single-service database deployment."""
         with self.store._connect() as connection:
             rows = connection.execute("SELECT run_id FROM case_runs WHERE status='running'").fetchall()
         for row in rows:
-            try:
-                self.store.admission(row[0])
-            except ValueError:
-                continue
+            self.store.admission(row[0])  # fail explicitly on an incompatible graph version
             self.resume(row[0], preserve_cancel=True)
 
     def resume(self, run_id, *, preserve_cancel=False):
         with self._lock:
             if self._closing:
                 raise ValueError("service is closed")
-            current = self._futures.get(run_id)
-            if current is not None and not current.done():
+            if run_id in self._futures:
                 raise ValueError("run is already active")
-            record = self.store.get_run(run_id)
-            if record and record["status"] == "cancelled":
-                raise ValueError("cancelled runs are terminal; submit a new run")
-            payload = self.store.admission(run_id)
-            self.store.prepare_run(run_id, self._config, _scope_from_state(payload))
+            record = self.status(run_id)
+            if record and record["status"] in {"success", "partial", "cancelled"}:
+                raise ValueError("completed/cancelled runs are terminal; submit a new run")
+            state = self.store.admission(run_id)
+            self.store.prepare_run(run_id, self._config, scope_from_state(state))
             if not preserve_cancel:
                 self.store.mark_running(run_id)
-            self._futures[run_id] = asyncio.run_coroutine_threadsafe(self._run_guarded(payload, resume=True), self._loop)
+            self._track(run_id, self._run_guarded(state, resume=True))
         return {"run_id": run_id, "status": "running"}
 
     def close(self):
@@ -286,6 +189,8 @@ class CaseRunService:
                 task.cancel()
             await asyncio.gather(*pending, return_exceptions=True)
             await self._loop.shutdown_default_executor()
+            if hasattr(self.reasoner, "aclose"):
+                await self.reasoner.aclose()
         if self._loop.is_running():
             self._closing = True
             for control in list(self._controls.values()):
@@ -312,6 +217,7 @@ class CaseRunService:
             self.store.finish_run(run_id, "cancelled")
             return None
         except Exception as exc:
+            logging.getLogger(__name__).exception("case graph failed: %s", run_id)
             if self.store.is_cancel_requested(run_id):
                 # LangGraph may wrap a cooperative callback cancellation in a
                 # node-specific exception before it reaches this boundary.
@@ -324,49 +230,35 @@ class CaseRunService:
         finally:
             self._controls.pop(run_id, None)
 
-    async def _run_graph(self, state: Mapping[str, Any], *, resume=False, control=None) -> Any:
+    async def _run_graph(self, state, *, resume=False, control=None):
+        import aiosqlite
         from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
-
         from .case_workflow_graph import build_case_workflow_graph
 
-        async with AsyncSqliteSaver.from_conn_string(str(self.checkpoint_path)) as checkpointer:
-            graph = build_case_workflow_graph(
-                planner=lambda current, context: self._guarded_callback("plan", self._planner, current, context),
-                executor=self.executor,
-                verifier=lambda current, context: self._guarded_callback("central_verify", self._verifier, current, context),
-                recheck_planner=lambda current, context: self._guarded_callback("plan_rechecks", self._recheck_planner, current, context),
-                recheck_allowed=lambda current: self._guarded_callback("route_after_verify", self._recheck_allowed, current),
-                summarizer=lambda current, context: self._guarded_callback("summarize", self._summarizer, current, context),
-                checkpointer=checkpointer,
-                max_recheck_rounds=1,
-            )
-            config = {"configurable": {"thread_id": f"native-v2:{state['case_id']}:{state['run_id']}"},
-                      "max_concurrency": self._config.case_task_limit,
-                      "recursion_limit": 4*self._config.max_total_tasks+20}
+        # Explicit strict deserialization. State contains JSON and LangGraph's
+        # safe built-in Send type only; no arbitrary Python object restoration.
+        serde = JsonPlusSerializer(pickle_fallback=False, allowed_msgpack_modules=None)
+        async with aiosqlite.connect(str(self.checkpoint_path)) as connection:
+            saver = AsyncSqliteSaver(connection, serde=serde)
+            graph = build_case_workflow_graph(executor=self.executor, reasoner=self.reasoner, checkpointer=saver)
+            config = {"configurable": {"thread_id": f"native-v3:{state['case_id']}:{state['run_id']}"},
+                "max_concurrency": self._config.case_task_limit,
+                "recursion_limit": (self._config.max_worker_steps*3+8)*self._config.max_total_tasks+50}
             snapshot = await graph.aget_state(config)
-            result = await graph.ainvoke(None if resume and snapshot.values else dict(state), config, durability="sync", control=control)
-
-        report = result.get("report") if isinstance(result, Mapping) else None
-        if isinstance(report, Mapping):
-            self.store.project(str(state["run_id"]),
-                [InvestigationTask.from_dict(t) for t in result["tasks"]],
-                result.get("task_outcomes", {}), self._config, _scope_from_state(state))
-            self.store.publish_report(str(state["run_id"]), report,
-                "success" if result.get("execution_status") == "success" else "failed")
+            async for namespace, event in graph.astream(None if resume and snapshot.values else state, config,
+                    durability="sync", control=control, stream_mode="tasks", subgraphs=True):
+                node = event.get("name", "graph")
+                status = "failed" if event.get("error") else "succeeded" if "result" in event else "started"
+                self.store.record_event(state["run_id"], node, status, {"namespace": list(namespace)})
+                self._notify()
+            result = (await graph.aget_state(config)).values
+        if result.get("report"):
+            self.store.project(state["run_id"], [InvestigationTask.from_dict(t) for t in result["tasks"]],
+                result["task_outcomes"], self._config, scope_from_state(state))
+            self.store.publish_report(state["run_id"], result["report"], result["report"]["status"])
+            self._notify()
         return result
 
 
-def _scope_from_state(state: Mapping[str, Any]) -> CaseTaskScope:
-    value = state["case_scope"]
-    if not isinstance(value, Mapping):
-        raise ValueError("case_scope must be a mapping")
-    return CaseTaskScope(
-        entity_ids=frozenset(value.get("entity_ids") or ()),
-        fact_ids=frozenset(value.get("fact_ids") or ()),
-        allowed_tools=frozenset(value.get("allowed_tools") or ()),
-        time_range=tuple(value["time_range"]) if value.get("time_range") is not None else None,
-    )
-
-
-def _sse(event: str, data: Mapping[str, Any]) -> str:
-    return f"event: {event}\ndata: {json.dumps(dict(data), ensure_ascii=False)}\n\n"
+def _sse(event, data):
+    return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"

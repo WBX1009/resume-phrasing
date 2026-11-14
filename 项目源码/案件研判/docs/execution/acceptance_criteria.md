@@ -1,112 +1,29 @@
-# Release acceptance checklist
+# 验收与复现
 
-This checklist is intentionally executable. A release is not complete until
-the commands and assertions below have current evidence in the run artifact.
-
-Scope: this checklist covers the public model-result snapshot/quality CLI. Its
-passing tests and benchmark do not prove the résumé's separate case-level event
-evaluation, LangGraph case workflow, hosted LangSmith experiments, GaussDB
-workload, or FastAPI/SSE service. Those claims use the strict, separate gate in
-[`resume_alignment_acceptance.md`](resume_alignment_acceptance.md).
-
-## Commands
+在项目目录安装 requirements.txt 后执行：
 
 ```powershell
-$py='python'
-& $py -m pytest -q
-& $py -m src.quality_cli catalog validate
-& $py -m src.quality_cli evaluate --output-root output\quality_runs
-& $py scripts/benchmark_quality_pipeline.py --runs 10 --threshold 1.3
-& $py scripts/fuzz_quality_pipeline.py --rounds 100 --seed 20260907
-& $py scripts/goal_watch.py --once
+python -B -m pytest -q -p no:cacheprovider
+python -B -m compileall -q src tests
 ```
 
-## Hard gates
+CI 位于仓库 .github/workflows/case-investigation.yml，在 Linux / Windows 的 Python 3.11 环境运行同一套无密钥测试。完整测试不依赖私有快照、在线模型或真实数据库。2026-11-14 在 Windows / Python 3.12.14 按固定依赖执行：86 passed，2 条来自 LangSmith SDK 的弃用/Beta 警告；pip check 与编译检查通过。线上环境仍需按真实模型与授权数据执行效果验收。
 
-- Existing and quality-pipeline tests pass (82 currently collected).
-- Catalog reports exactly 104 total, 61 sampled and 43 unsupported-no-sample.
-- All 61 sampled model entries have unique strategy keys and are processed in
-  the all-snapshot run.
-- The user-facing `report.md` exists, is self-contained and loadable; JSON/trace/
-  manifest/checkpoint remain loadable internal evidence. Existing HTML/DOCX
-  projections are compatibility artifacts, not a reason to block the core
-  Markdown chain.
-- Claim reference validation has zero missing fact IDs.
-- Fault suite passes empty data, malformed data, wrong data types, duplicates,
-  unknown tools and orphan references.
-- The report manifest records snapshot hash, policy counts, elapsed time and
-  online budget usage.
-- An intentionally interrupted running checkpoint resumes without duplicate
-  model evidence and matches a clean-run replay fingerprint.
-- A running checkpoint rejects missing committed state records and mismatched
-  case filters instead of silently emitting a partial or cross-case report.
-- The emitted report passes the versioned JSON structural contract, and a
-  malformed report is rejected by the contract validator.
-- The frozen API contract documents request/response fields, state transitions,
-  error codes, idempotency and CLI/HTTP mapping; implementation changes must
-  update its contract tests.
-- Identifier-like fields (phone/account/card/credential numbers) are excluded
-  from numeric metric generation and covered by a regression test.
-- The public CLI catalog, resume and replay commands return the expected
-  status codes and validated JSON payloads.
-- Git-tracked files contain no local credential material, and known local key
-  files are covered by `.gitignore`.
-- The default 8,000-character context pack retains every Fact ID and reports
-  zero budget-exceeded events in the all-snapshot run.
-- Corrupt cached LLM payloads are discarded and safely re-requested or
-  downgraded; they never bypass the structured advisory contract.
-- Date/time fields are excluded from amount-like numeric summaries, while
-  duration fields remain eligible for deterministic metrics.
-- JSONL catalog/snapshot loading rejects non-object records and invalid integer
-  keys with a file/row diagnostic.
-- Completed artifacts cross-check run identity, snapshot hash, status, model
-  count and event/model IDs across `report.json`, `run_manifest.json`,
-  `checkpoint.json`, `checkpoint_models.jsonl`, `trace.jsonl`, Markdown and
-  HTML; tampering any projection must fail replay validation.
-- Public replay fails closed with structured diagnostics when the report is
-  missing required sections, trace event IDs are missing, or checkpoint model
-  IDs drift from the report.
-- The versioned report contract validates Fact shape/types and rejects Claim
-  references to unknown Fact or Model IDs.
-- Markdown/HTML projections and trace payloads are regenerated or compared
-  against `report.json`; preserving a run ID while changing content must fail.
-- Report model IDs are unique, and model-row coverage counts agree with both
-  the report coverage block and manifest profile counts.
-- DOCX is regenerated from the JSON source and its document XML is compared;
-  preserving a run ID while changing DOCX content must fail replay.
-- The 10-run performance benchmark also requires all deterministic replay
-  fingerprints to be identical.
-- Same-second or simultaneous CLI runs must reserve distinct output directories;
-  concurrent cache publishers must leave a valid JSON entry and no temporary
-  files, including on Windows sharing-violation paths.
-- Concurrent LLM callers must update the in-process budget ledger atomically;
-  a check-then-increment race must not exceed the configured call/token caps.
-- The bounded adapter must reject non-positive or non-integer `max_tokens`
-  before reserving budget or invoking a provider.
-- Budget ledger caps/counters and provider-reported token counts must be
-  non-negative integers; invalid values fail closed before reconciliation.
-- Invalid provider token usage must not publish a successful cache payload or
-  disappear from the budget ledger.
-- Checkpoint cleanup and all text/DOCX projections must be atomically published
-  so an interrupted write cannot replace a valid artifact with a torn file.
-- The executable goal gate must reject negative/invalid aggregate online-budget
-  fields and refuse completion when calls exceed 200 or tokens exceed
-  2,000,000, even if elapsed time and other acceptance families pass.
-- No `.env` or credential-like file is tracked by Git.
-- Completion remains blocked until the wall-clock timestamp in
-  `docs/execution/goal_state.json` is at least 24 hours after `started_at`.
-- Every acceptance family listed by `check_goal_gate.py` must carry a value
-  beginning with `passed`; missing, failed or arbitrary status values block
-  completion even after the time gate elapses.
-- The deterministic malformed-input fuzz harness must report `valid: true` for
-  100 rounds across all 104 profiles with no exception or orphan Claim.
-- Public `catalog validate` and `evaluate` calls against a missing or malformed
-  data directory must return structured JSON and exit code 2, not an uncaught
-  traceback.
-- Evaluation assets must keep dev, validation, backtest and bad-case roles
-  distinct; a bad case is closed only after a fix, regression test and review
-  note are recorded.
-- An external blocker may receive at most two purposeful attempts. After the
-  second failed attempt, the command, error, impact and workaround must be
-  recorded in `docs/evaluation/bad_case_register.md`, and execution must return
-  to the offline Markdown chain.
+| 业务边界 | 测试 |
+| --- | --- |
+| 无预置 Task，候选先于计划，原生多步 Worker、依赖新事实 | test_case_end_to_end.py |
+| 两路候选、范围/事实锚点、去重与有界选择 | test_case_authorization.py |
+| 参数越界在调用预算和实际 I/O 前拒绝，原专属工具复用 | test_case_authorization.py |
+| 独立 gap_id、补证引用新证据、只关闭对应需求 | test_case_end_to_end.py |
+| RetryPolicy、单节点超时、错误分类、失败阻断、取消 | test_case_runtime_controls.py |
+| 每案与共享资源额度、阻塞线程取消不提早归还资源 | test_case_runtime_controls.py |
+| 原子预算、真实模型适配器关闭 SDK 重试并预留输入/输出 | test_case_policy.py |
+| 外部写幂等、回执不确定拒绝重放 | test_case_runtime_controls.py |
+| 硬退出后重启，工具→Judge、核验、补证、报告发布边界 | test_case_process_recovery.py |
+| 原生并行 pending writes，成功兄弟任务不重放；不读取内部 writes 表 | test_case_process_recovery.py |
+| API / CLI 唯一入口、partial 报告、SSE 投影损坏容错、导入无副作用 | test_case_api.py |
+| 同一报告的多格式事实引用一致、SQL 参数化 | test_case_policy.py |
+| 数据库仓库准入、连接关闭、有界上下文及失败任务的已完成事实保留 | test_case_repository.py |
+| 事件计分、冻结评测条件、LangSmith evaluator、耗时统计 | test_event_evaluation / test_evaluation_protocol / test_langsmith_event_evaluation / test_performance_evaluation |
+
+旧手写编排和私有快照专属测试随入口删除；关键预算、授权、幂等、重试、失败阻断、恢复断言在新端到端路径重新覆盖。测试条数不与旧架构直接比较。当前验收不包含生产数据库连通性、真实模型语义准确率、专家标注或多机器部署能力。

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "model-insight-agent"
-version = "0.1.0"
+version = "0.3.0"
 description = "Evidence-first research CLI for model-result investigation reports"
 requires-python = ">=3.11"
 dependencies = [
@@ -21,10 +21,10 @@ workflow = ["langgraph==1.2.6", "langgraph-checkpoint-sqlite==3.1.1"]
 evaluation = ["langsmith==0.9.1"]
 api = ["fastapi==0.138.0", "uvicorn==0.49.0"]
 database = ["psycopg2-binary==2.9.12"]
-dev = ["pytest>=8.0"]
+dev = ["pytest==9.2.0", "httpx==0.28.1"]
 
 [project.scripts]
-model-insight = "src.quality_cli:main"
+model-insight = "src.case_cli:main"
 
 [tool.setuptools]
 packages = ["src", "src.model_tools"]
